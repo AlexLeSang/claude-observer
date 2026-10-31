@@ -1,0 +1,20 @@
+{
+  "name": "usage-observer",
+  "displayName": "Usage Observer",
+  "version": "0.5.0",
+  "description": "Local-only Claude Code telemetry: captures agents, subagents, skills, tools, tokens, context and cost into the project's own logs/.",
+  "author": { "name": "Oleksandr Halushko" },
+  "homepage": "https://github.com/alexlesang/claude-observer",
+  "repository": "https://github.com/alexlesang/claude-observer",
+  "license": "MIT",
+  "keywords": ["telemetry", "usage", "tokens", "cost", "observability", "subagents", "local-only"],
+  "userConfig": {
+    "capture": {
+      "type": "string",
+      "title": "Capture file",
+      "description": "Where the plugin appends its records, relative to the project's main checkout (or absolute).",
+      "default": "logs/agent-telemetry.mod.jsonl"
+    }
+  },
+  "types": "./types/index.d.ts"
+}

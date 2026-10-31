@@ -1,0 +1,16 @@
+{
+  "name": "usage-observer",
+  "owner": {
+    "name": "Oleksandr Halushko"
+  },
+  "metadata": {
+    "description": "claude-observer: local-only Claude Code usage telemetry."
+  },
+  "plugins": [
+    {
+      "name": "usage-observer",
+      "source": "./plugin",
+      "description": "Local-only Claude Code telemetry."
+    }
+  ]
+}

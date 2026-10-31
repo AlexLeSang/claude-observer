@@ -1,0 +1,21 @@
+# Spend views: sessions, subagents, models, tickets, digest
+
+Run through the runner only. `--limit` (default 5) cuts the per-session or per-ticket list; a line "N older sessions not shown, raise --limit" says rows are hidden. A total row, and the first `models` and `subagents` tables, cover everything in the capture, not only the rows shown.
+
+## Columns
+
+- `sessions`: one row per session. `reqs` model requests; `iters` loop requests (main loop and subagents); `sub` the part of `iters` made by subagents the session launched (they share its session id); `cost`; `tokens`; `cache%` cache read over all input tokens; `side%` and `side$%` share of requests and of cost spent on side requests (titles, hook prompts, summaries); `peak` highest context fill (`-` in the total row); `compact` main-loop compactions that installed a summary; `models` and `effort` of loop requests, most used first.
+- `subagents`: one row per subagent type (the agent type a request ran as: built-in, custom or plugin-shipped), `main` for the main loop. `runs` = the main loop answering one prompt, or one subagent; `median` iterations per run; `tools`, `failed` tool calls; `cost/iter`; `flagged` = runs of at least 10 iterations and 3x the subagent's median.
+- `models`: per model x effort, over the whole capture and per session: `iters`, `output` tokens, `out/iter`, `cost`, `$/iter` (cost per costed iteration), `stops` (stop reasons, from the plugin's step records only). It shows what a setting spends, never whether its answers were better.
+- `tickets`: one row per kanban ticket (only where the project has a board): `sessions`, `runs`, `reqs`, `iters`, `cost`, `build`/`review`/`fix` (cost/requests by phase), `wall` (summed first-to-last request time, idle gaps included), `source` (what attributed it), `status` from the board. `(unattributed ...)` rows hold what nothing matched; the total equals `sessions`.
+- `digest`: a Markdown summary of the last 7 days, printed (no file is written): totals, the costliest sessions (`--limit`), and "Worth a look" flags (context peaked at 80% or more, compacted, 25% or more of cost on side requests). A session marked `(clipped)` started before the window or ran past it: its `started` is the real start, its cost and tokens are only the part inside the window, and it gets no flags, so say "flags are not available for it" rather than "no problem".
+
+## Traps
+
+- Cost is Claude Code's own `cost_usd` on each model request, summed. A request without one (a prompt known only from the plugin's step record, for example when the OTel mirror is off) is left out. The note "N requests without cost (left out of cost)" says so (`models` and `subagents`: "N iterations without cost"), a session with none shows `-`, and `tickets` marks a lower bound as `$x+`. Call such a figure "at least". These views never price from the static model price table; only `skills` does (see overhead.md), so a model missing from that table does not change spend figures.
+- `compact` counts main-loop compactions only; a subagent's compaction is left out and noted ("N subagent compactions not counted in compact"). Say that subagents compacted, not that the main loop did.
+- `peak` is the highest `measure` fill of the session, the same rule `context` uses; `-` with the note "peak context needs the plugin capture" means the session has no `measure` records, not an empty context.
+- The current session is in every table and is still growing; its figures are lower than its final ones.
+- `tickets` shows only the newest tickets (highest ids), `--limit` of them ("N tickets not shown (showing the newest, highest ids), raise --limit"). Older ticket spend is in the unlisted rest; raise `--limit` before saying a ticket cost nothing.
+- `subagents` and `tickets` join local transcripts. The runner runs the report from the main checkout, also when you are in a linked worktree, so they read the main checkout's transcripts and its `<slug>--claude-worktrees-*` sibling folders (the worktrees under `.claude/worktrees`); a session run in a worktree elsewhere shows as "no transcript".
+- `models`: `out/iter` is output over all iterations, `$/iter` is cost over costed iterations only, so the two have different bases when some iterations have no cost.

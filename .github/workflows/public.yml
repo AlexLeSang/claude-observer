@@ -1,0 +1,51 @@
+# Public pull-request checks: the manifests validate, and the plugin installs from the checkout.
+# It is self-contained (no script from the repository is called) so it runs in the published tree.
+# Claude Code is pinned to an exact version; raise it on purpose. The workflow uses no secrets.
+name: public
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLAUDE_CODE_VERSION: "2.1.312"
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install Claude Code (pinned)
+        run: |
+          npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+          claude --version
+
+      - name: Validate the marketplace (--strict)
+        run: claude plugin validate --strict .
+
+      - name: Validate the plugin (--strict)
+        run: claude plugin validate --strict plugin
+
+      - name: Install smoke (marketplace add from the checkout, install, scripts and hooks present)
+        run: |
+          export CLAUDE_CONFIG_DIR="${RUNNER_TEMP}/claude-config"
+          mkdir -p "${CLAUDE_CONFIG_DIR}"
+          claude plugin marketplace add "${GITHUB_WORKSPACE}"
+          claude plugin install usage-observer@usage-observer --scope user
+          cache="${CLAUDE_CONFIG_DIR}/plugins/cache/usage-observer/usage-observer"
+          found="$(find "${cache}" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          test -n "${found}" || { echo "FAIL: no cache copy under ${cache}"; exit 1; }
+          for dir in scripts hooks; do
+            test -n "$(find "${found}/${dir}" -type f -print -quit 2>/dev/null)" \
+              || { echo "FAIL: ${dir}/ is missing or empty in ${found}"; exit 1; }
+          done
+          echo "install smoke OK: ${found}"
