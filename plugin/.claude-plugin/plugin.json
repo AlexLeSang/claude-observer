@@ -1,7 +1,7 @@
 {
   "name": "usage-observer",
   "displayName": "Usage Observer",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Local-only Claude Code telemetry: captures agents, subagents, skills, tools, tokens, context and cost into the project's own logs/.",
   "author": { "name": "Oleksandr Halushko" },
   "homepage": "https://github.com/alexlesang/claude-observer",

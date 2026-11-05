@@ -33,6 +33,7 @@ import {
   otelRecord,
   pluginRegisterRecord,
   pluginSetRecord,
+  promptSubmitRecord,
   skillRecord,
   spawnRecord,
   stepRecord,
@@ -50,8 +51,17 @@ const HEARTBEAT_PREFIX = 'heartbeat:'
 // for the next one to trust; in $.store, which outlasts it, a stale mark skipped the announce.
 const ANNOUNCED_KEEP = 20
 const APPEND_TIMEOUT_MS = 10000
-// The appender imports the second one, so a copy that has lost either cannot write.
-const APPENDER_SCRIPTS = ['mod_capture_append.py', 'agent_telemetry.py', 'capture_exclude.py', 'capture_paths.py']
+// The appender imports the rest when it loads, so a copy that has lost any of them cannot write.
+// A package test derives this list from the appender's imports and fails when it drifts.
+const APPENDER_SCRIPTS = [
+  'mod_capture_append.py',
+  'agent_telemetry.py',
+  'capture_exclude.py',
+  'capture_paths.py',
+  'quota_latest.py',
+  'instant_util.py',
+  'safe_name.py',
+]
 // The appender's one-line notice that git may still list the capture (it could not write .git/info/exclude).
 const GIT_NOTICE = /^mod_capture_append: git-exclude: (.*)$/m
 // A machine with no interpreter is probed again this often, not at every flush.
@@ -534,6 +544,18 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // The prompt's origin kind, so a prompt nobody typed (a task notification) can be told from one that was.
+  // Recorded after `next`: by then the prompt has entered the session and `promptId` is its own.
+  on('prompt.submit', async ($, e, next) => {
+    const result = await next(e)
+    try {
+      push({ ...(await base($, 'prompt_submit')), ...promptSubmitRecord(e) })
+    } catch {
+      // Observation only.
+    }
+    return result
+  })
+
   on('classic.SubagentStart', async ($, e, next) => {
     agentTypes.set(e.agent_id, e.agent_type)
     return next(e)
@@ -719,7 +741,12 @@ export const register: Register = (on, options) => {
         context_window: e.context.window,
         context_percent: e.context.percent ?? null,
         cost_usd: e.cost?.usd ?? null,
-        rate_limits: e.rateLimits.map(r => ({ kind: r.kind, percent: r.percentUsed })),
+        // resets_at is the engine's ISO string as given; the key is absent when the engine sends none.
+        rate_limits: e.rateLimits.map(r => ({
+          kind: r.kind,
+          percent: r.percentUsed,
+          ...(typeof r.resetsAt === 'string' ? { resets_at: r.resetsAt } : {}),
+        })),
       })
       await track($, live => applyMeasure(live, e))
     } catch {

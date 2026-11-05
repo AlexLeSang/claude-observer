@@ -47,6 +47,7 @@ from urllib.parse import unquote
 
 import agent_telemetry as at
 import capture_exclude
+import quota_latest
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -548,6 +549,7 @@ def append_batch(
     out: list[str] = []
     skipped = 0
     dropped_before = _dropped
+    newest: tuple[datetime, list[dict[str, Any]]] | None = None
     for line in batch.splitlines():
         if not line.strip():
             continue
@@ -559,6 +561,7 @@ def append_batch(
             if record.get("kind") == "otel":
                 record = otel_to_receiver_record(record)
             out.append(json.dumps(clean_record(record)) + "\n")
+            newest = _newer_reading(newest, record)
         except (ValueError, RecursionError):  # not JSON, or nested past the recursion limit
             skipped += 1
             continue
@@ -576,7 +579,37 @@ def append_batch(
         warning = capture_exclude.ensure_excluded(capture, budget=exclude_budget)
         if warning:
             print(f"mod_capture_append: {warning}", file=sys.stderr)
+    if newest is not None:
+        _write_latest(*newest)
     return len(out)
+
+
+def _newer_reading(
+    newest: tuple[datetime, list[dict[str, Any]]] | None, record: dict[str, Any]
+) -> tuple[datetime, list[dict[str, Any]]] | None:
+    """`newest`, or this `measure` record's quota windows when it is newer (by its own `ts`)."""
+    if record.get("kind") != "measure":
+        return newest
+    observed = quota_latest.parse_instant(record.get("ts"))
+    windows = quota_latest.clean_windows(record.get("rate_limits"))
+    if observed is None or not windows or (newest is not None and newest[0] >= observed):
+        return newest
+    return observed, windows
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _write_latest(observed: datetime, windows: list[dict[str, Any]]) -> None:
+    """The per-machine latest-quota file. A failure costs a warning, never the batch."""
+    now = _utc_now()
+    if observed > now + quota_latest.SKEW:  # a wrong clock must not pin the file as the newest reading
+        return
+    try:
+        quota_latest.write_latest(quota_latest.latest_path(), observed, windows, now)
+    except (OSError, ValueError):
+        print("mod_capture_append: could not write the latest quota file", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:

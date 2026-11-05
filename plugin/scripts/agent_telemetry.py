@@ -26,6 +26,8 @@ sets the rows per list. Both views live in agent_tool_report.py.
 each with its tool calls) per run (main loop per prompt, or one subagent) by
 agent type, model, task and session, the busiest runs, outliers, repeated
 failing calls and side requests; it lives in agent_iteration_report.py.
+`report --prompts` ranks the costliest prompts, each with the cost of the subagents it dispatched rolled up
+through the plugin's agent_spawn records (`--json` for a document); it lives in agent_prompt_report.py.
 `report --subagents` regroups the same runs by subagent (agent type: main loop or
 subagent type, with where it is defined): tokens, cost, iterations and tool usage per
 subagent, per model and per session; it lives in agent_subagent_report.py.
@@ -45,6 +47,9 @@ trigger, the tokens of the prompts that activated each skill, each skill's
 load overhead (plugin capture only) and the sessions with activations; redacted `custom_skill` names are recovered from
 the usage-observer plugin's records and the project's transcripts. It lives in
 agent_skill_report.py.
+`report --friction [--json]` prints failing hook executions per hook_name and tool error signatures
+recurring across sessions (tool name and error kind only, never error text), with a scope line on every run.
+
 `report --plugins` prints plugin inventory, version drift, installs, session
 cost with and without each plugin and hook overhead (see agent_plugin_report.py).
 `report --sessions` prints one row per session: cost, tokens, cache share, models
@@ -838,6 +843,25 @@ def _report_tools(
     return 0
 
 
+def _report_friction(
+    args: argparse.Namespace,
+    capture: Path,
+    project_filter: ProjectFilter | None,
+    project_dir: Path | None,
+) -> int:
+    # Imported here so this file keeps depending on the standard library alone.
+    import agent_friction_report as friction_report
+
+    if project_filter is not None:  # stdout stays one JSON document: with --json the summary goes to stderr
+        print(project_filter.summary(), file=sys.stderr if args.json else sys.stdout)
+    import agent_tool_report as tool_report
+
+    dirs = tool_report.transcript_dirs(_transcript_dir(project_filter, project_dir))
+    limit = args.limit or friction_report.TABLE_LIMIT
+    print(friction_report.render(capture, project_filter, as_json=args.json, transcript_dirs=dirs, limit=limit))
+    return 0
+
+
 def _print_undated(undated: int) -> None:
     if undated:
         print(
@@ -1004,6 +1028,31 @@ def _report_sessions(
     return 0
 
 
+def _report_prompts(
+    args: argparse.Namespace,
+    capture: Path,
+    project_filter: ProjectFilter | None,
+) -> int:
+    # Imported here so this file keeps depending on the standard library alone.
+    import agent_prompt_report as prompt_report
+    import agent_usage_report as usage_report
+
+    since = usage_report._parse_cli_timestamp(args.since)[0]  # noqa: SLF001
+    until = usage_report._parse_cli_timestamp(args.until)[0]  # noqa: SLF001
+    data = prompt_report.read(capture, project_filter)
+    result = prompt_report.build(data, since, until)
+    limit = args.limit or prompt_report.DEFAULT_LIMIT
+    if args.json:  # stdout stays one JSON document: the project summary goes to stderr
+        if project_filter is not None:
+            print(project_filter.summary(), file=sys.stderr)
+        print(prompt_report.to_json(result, data, limit))
+        return 0
+    if project_filter is not None:
+        print(project_filter.summary())
+    print(prompt_report.format_table(result, data, limit))
+    return 0
+
+
 def _report_digest(
     args: argparse.Namespace,
     capture: Path,
@@ -1085,7 +1134,7 @@ def cmd_report(args: argparse.Namespace) -> int:
     status = _cmd_report(args)
     note = tool_report.rejected_note()
     if note:
-        print(note)
+        print(note, file=sys.stderr if args.json else sys.stdout)
     return status
 
 
@@ -1097,6 +1146,7 @@ def _view_conflict(args: argparse.Namespace) -> str | None:
     if args.digest or args.tickets or args.sessions:
         return None
     views = [
+        ("--prompts", args.prompts),
         ("--iterations", args.iterations),
         ("--subagents", args.subagents),
         ("--reasoning", args.reasoning),
@@ -1105,6 +1155,7 @@ def _view_conflict(args: argparse.Namespace) -> str | None:
         ("--fixed-context", args.fixed_context),
         ("--skills", args.skills),
         ("--plugins", args.plugins),
+        ("--friction", args.friction),
     ]
     chosen = [name for name, on in views if on]
     if len(chosen) > 1:
@@ -1121,14 +1172,16 @@ def _window_error(args: argparse.Namespace) -> str | None:
 
     # _cmd_report picks --digest, --tickets, --sessions, --iterations, --subagents in that order, so
     # --sessions hides the window from --iterations and --subagents.
-    windowed = args.tickets or args.digest or (not args.sessions and (args.iterations or args.subagents))
+    windowed = (
+        args.tickets or args.digest or (not args.sessions and (args.iterations or args.subagents or args.prompts))
+    )
     if (args.since is not None or args.until is not None) and not windowed:
-        if args.sessions and (args.iterations or args.subagents):
+        if args.sessions and (args.iterations or args.subagents or args.prompts):
             return (
-                "--since and --until do not apply to --sessions, which takes precedence over --subagents and "
-                "--iterations; drop --sessions to window those"
+                "--since and --until do not apply to --sessions, which takes precedence over --prompts, --subagents "
+                "and --iterations; drop --sessions to window those"
             )
-        return "--since and --until only apply to --tickets, --digest, --iterations and --subagents"
+        return "--since and --until only apply to --tickets, --digest, --iterations, --subagents and --prompts"
     if (args.days is not None or args.last_session or args.out) and not args.digest:
         return "--days, --last-session and --out only apply to --digest"
     if args.last_session and (args.days is not None or args.since is not None or args.until is not None):
@@ -1152,6 +1205,9 @@ def _window_error(args: argparse.Namespace) -> str | None:
 def _cmd_report(args: argparse.Namespace) -> int:
     if args.board and not args.tickets:
         print("--board only applies to --tickets", file=sys.stderr)
+        return 2
+    if args.json and (args.digest or args.tickets or args.sessions or not (args.friction or args.prompts)):
+        print("--json only applies to --friction and --prompts", file=sys.stderr)  # not to a view that overrides them
         return 2
     window_error = _window_error(args)
     if window_error:
@@ -1193,13 +1249,15 @@ def _cmd_report(args: argparse.Namespace) -> int:
         # means no root owns the label, so they read no transcripts at all.
         project_dir = project_filter.project_dir
     else:
-        print(ALL_PROJECTS_WARNING)
+        print(ALL_PROJECTS_WARNING, file=sys.stderr if args.json else sys.stdout)
     if args.digest:
         return _report_digest(args, capture, project_filter)
     if args.tickets:
         return _report_tickets(args, capture, project_filter, project_dir)
     if args.sessions:
         return _report_sessions(args, capture, project_filter)
+    if args.prompts:
+        return _report_prompts(args, capture, project_filter)
     if args.iterations:
         return _report_iterations(args, capture, project_filter, project_dir)
     if args.subagents:
@@ -1216,6 +1274,8 @@ def _cmd_report(args: argparse.Namespace) -> int:
         return _report_skills(args, capture, project_filter, project_dir)
     if args.plugins:
         return _report_plugins(capture, project_filter, project_dir)
+    if args.friction:
+        return _report_friction(args, capture, project_filter, project_dir)
     if args.tools or args.failures or args.by_session:
         return _report_tools(args, capture, project_filter, project_dir)
     totals = aggregate(capture, project_filter)
@@ -1362,10 +1422,28 @@ def main(argv: list[str] | None = None) -> int:
         "plugin, hook registrations and per-plugin hook overhead from local transcripts (overrides --tools)",
     )
     report.add_argument(
+        "--friction",
+        action="store_true",
+        help="failing hook executions per hook and recurring tool error signatures (tool name and error kind, "
+        "never error text), with a scope line on every run",
+    )
+    report.add_argument(
+        "--json",
+        action="store_true",
+        help="with --friction or --prompts: print machine-readable output (--prompts: one JSON document with full session and prompt ids)",
+    )
+    report.add_argument(
         "--sessions",
         action="store_true",
         help="one row per session: cost, tokens, cache share, models and effort, iterations, "
         "side-request share, peak context and compactions (overrides the other views)",
+    )
+    report.add_argument(
+        "--prompts",
+        action="store_true",
+        help="the costliest prompts (top 10, --limit N), each with the cost of the subagents it dispatched rolled "
+        "up through the spawn chain; subagent cost that cannot be tied stays in an untied row; prints coverage, "
+        "a per-version table and two checks; takes --since and --until (overridden by --sessions)",
     )
     report.add_argument(
         "--tickets",
@@ -1388,12 +1466,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     report.add_argument(
         "--since",
-        help="with --tickets, --digest, --iterations or --subagents: only requests stamped at or after this ISO-8601 date/timestamp "
+        help="with --tickets, --digest, --iterations, --subagents or --prompts: only requests stamped at or after this ISO-8601 date/timestamp "
         "(a naive value is local time; same parsing as agent_usage_report --since)",
     )
     report.add_argument(
         "--until",
-        help="with --tickets, --digest, --iterations or --subagents: only requests stamped at or before this ISO-8601 date/timestamp "
+        help="with --tickets, --digest, --iterations, --subagents or --prompts: only requests stamped at or before this ISO-8601 date/timestamp "
         "(inclusive; a date alone means 00:00, so it leaves out the rest of that day)",
     )
     report.add_argument(
@@ -1407,7 +1485,7 @@ def main(argv: list[str] | None = None) -> int:
         help="rows per list: sessions for --by-session and --skills (default 20), "
         "failures per group for --failures (default 5); sessions (default 20) and "
         "runs (default 10) for --iterations; sessions (default 20) and tools per subagent (default 5) for "
-        "--subagents; tickets (default 20, the newest) for --tickets; costliest sessions (default 5) for --digest; sessions (default 20) for --sessions, --reasoning, --context, --models and --fixed-context",
+        "--subagents; tickets (default 20, the newest) for --tickets; costliest sessions (default 5) for --digest; prompts (default 10) for --prompts; recurring tool error signatures (default 10) for --friction; sessions (default 20) for --sessions, --reasoning, --context, --models and --fixed-context",
     )
     report.set_defaults(func=cmd_report)
 

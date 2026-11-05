@@ -1,4 +1,4 @@
-# Overhead views: skills, plugins
+# Overhead views: skills, plugins, friction
 
 Run through the runner only. `--limit` (default 5) bounds `skills`' session list only; `plugins` ignores it.
 
@@ -17,3 +17,20 @@ Run through the runner only. `--limit` (default 5) bounds `skills`' session list
 - The plugin capture mirrors `plugin_loaded` and hook registrations for interactive sessions only, not `claude -p` runs; absent plugins in a session can mean it was not interactive.
 - A skill that was never activated in the captured window does not appear; that is not the same as costing nothing, since its listing line is in the fixed context (see context.md, `fixed-context`).
 - The current session is in every table and still growing.
+
+`friction` ignores `--limit`. Its first line of the output is a scope line (`friction: ...`): quote its counts with every finding.
+
+## `friction` columns
+
+- Failing hooks: `hook_name` (kept as recorded, `<event>:<tool>` or the plain event name), `failing` as `failures of executions` (executions of the failing session-hook pairs), `blocking`, `sessions` (sessions where the hook failed), `clean_sessions` (sessions that ran the same hook without one failure; `every run` is a per-session reading, so read it next to this count), `failing_ms` (summed duration of the failing executions), `fix?` (`every run` when some session failed 100% of at least 2 executions) and the first and last day seen.
+- Failed hook runs by source (transcripts): `plugin` (an installed plugin's name, `(not a plugin)` or `(ambiguous)`), `exit code` kind, `runs`, `sessions`; plus an agreement line against the mirror.
+- Recurring tool error signatures: `tool_name` and `error_type` (never the error text), `sessions`, `failures`, share of sessions; at most 10 rows, then `... and K more`.
+
+## `friction` traps
+
+- "no failing hooks seen" means none in these captures, not that hooks work: a hook that never runs is invisible. Never say "healthy".
+- Only non-blocking errors count as failing. A blocking hook is a guard doing its job; it appears as one count line and in the `blocking` column.
+- The hook half has had no real failure in the project's own data yet; a row is worth checking against the hook's script before acting.
+- A recurring signature is not proof of a config problem: the top one is often ordinary task behaviour. Say "recurring", not "misconfigured".
+- The hook table names the hook by `hook_name`, not by plugin or settings file. The separate "Failed hook runs by source (transcripts)" table gives the plugin (or `(not a plugin)` or `(ambiguous)`) and the exit-code kind, but is not joined to a hook row: look the hook up yourself before advising a change.
+- The transcript table is UNVERIFIED on real data (no real failed run seen yet). If the agreement line shows sessions that differ, say the two sources disagree; do not pick one.

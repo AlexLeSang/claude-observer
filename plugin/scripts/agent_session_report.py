@@ -37,6 +37,8 @@ from typing import TYPE_CHECKING, Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agent_tool_report as tr
+import cache_misses as cm
+import decision_hints as dh
 from agent_context_fill import (
     COMPACTION,
     Compaction,
@@ -76,6 +78,7 @@ if TYPE_CHECKING:
 DEFAULT_SESSION_LIMIT = 20
 MODEL_PREFIX = "claude-"
 NONE = "-"
+COMPACT_SOURCE = "compact"  # query_source of the request that writes a compaction summary
 
 
 # --- loading ---------------------------------------------------------------------
@@ -101,6 +104,10 @@ class Request:
     subagent: str | None = (
         None  # subagent type (`agent.name`, else the last `query_source` part); None for the main loop
     )
+    agent_id: str | None = None  # api_request `agent_id`: absent before Claude Code 2.1.310
+    cache_5m: float | None = None  # api_request `cache_creation_5m_tokens`
+    cache_1h: float | None = None  # api_request `cache_creation_1h_tokens`
+    event: bool = False  # an `api_request` event, not a native step
 
 
 MAX_TICKET_DIGITS = 5
@@ -138,6 +145,7 @@ class Capture:
     native_compactions: list[Compaction] = dataclasses.field(default_factory=list)
     event_compactions: list[Compaction] = dataclasses.field(default_factory=list)
     unreadable: int = 0  # capture lines that were not JSON objects
+    mirrored: int = 0  # costed api_request repeats (same request id) dropped
     you_should_know: set[str] = dataclasses.field(default_factory=set)  # sessions whose plugin_set names the plugin
 
 
@@ -158,6 +166,10 @@ def api_request_of(attrs: dict[str, Any]) -> Request:
         sub=source.startswith(AGENT_SOURCE_PREFIX),
         request_id=tr.as_str(attrs.get("request_id")),
         subagent=kind if source.startswith(AGENT_SOURCE_PREFIX) else None,
+        agent_id=tr.as_str(attrs.get("agent_id")),
+        event=True,
+        cache_5m=tr.as_number(attrs.get("cache_creation_5m_tokens")),
+        cache_1h=tr.as_number(attrs.get("cache_creation_1h_tokens")),
     )
 
 
@@ -181,11 +193,17 @@ def _native_step(record: dict[str, Any]) -> Request:
     )
 
 
+def _id_text(value: object) -> str | None:
+    """A request id as `agent_prompt_report._s` reads it: a non-empty str, else nothing."""
+    return value if isinstance(value, str) and value else None
+
+
 def load_capture(capture: Path, project_filter: ProjectFilter | None = None) -> Capture:
     """Requests, native steps, context peaks and compactions that pass
     `project_filter`; native records are filtered by their session."""
     out = Capture()
     skipped = tr.Skipped()
+    seen: set[tuple[str, str]] = set()
     for record in tr.capture_records(capture, skipped):
         kind = record.get("kind")
         if kind == "agent_spawn":
@@ -231,7 +249,16 @@ def load_capture(capture: Path, project_filter: ProjectFilter | None = None) -> 
             if project_filter is not None and not project_filter.keep(attrs):
                 continue
             if name == tr.API_REQUEST:
-                out.requests.append(api_request_of(attrs))
+                request = api_request_of(attrs)
+                # The `--prompts` rule (agent_prompt_report._event): a costed request repeating a
+                # (session, request_id or client_request_id) is the mirrored copy of one request.
+                key = _id_text(attrs.get("request_id")) or _id_text(attrs.get("client_request_id"))
+                if key is not None and request.cost is not None:
+                    if (request.session, key) in seen:
+                        out.mirrored += 1
+                        continue
+                    seen.add((request.session, key))
+                out.requests.append(request)
             elif str(attrs.get("success")).lower() != "false":
                 out.event_compactions.append(event_compaction_of(attrs))
     out.unreadable = skipped.lines
@@ -324,6 +351,14 @@ class Session:
     compactions: int = 0  # main loop only (shared with --context)
     subagent_compactions: int = 0
     stamps: list[float] = dataclasses.field(default_factory=list, repr=False, compare=False)  # epoch seconds
+    sub_cost: float = 0.0  # cost of loop requests made by subagents
+    cache_rows: list[dh.CacheRow] = dataclasses.field(default_factory=list, repr=False, compare=False)
+    keyless_rows: int = 0  # subagent api_requests with no agent_id: left out of the cache hints
+    main_compaction_stamps: list[float] = dataclasses.field(default_factory=list, repr=False, compare=False)
+    agent_compaction_stamps: list[float] = dataclasses.field(default_factory=list, repr=False, compare=False)
+    native_agent_compactions: int = 0  # native subagent compactions: the miss block excuses one agent, the hints all
+    facts: dh.CacheFacts = dataclasses.field(default_factory=dh.CacheFacts, repr=False, compare=False)
+    misses: cm.Analysis = dataclasses.field(default_factory=cm.Analysis, repr=False, compare=False)
 
     def active_seconds(self, max_gap: float) -> float:
         """The sum of the gaps between consecutive request stamps that are at most `max_gap` seconds: the
@@ -351,8 +386,26 @@ class Session:
     def hook_cost_share(self) -> float | None:
         return _share(self.hook_cost, self.cost)
 
+    def hint_input(self) -> dh.HintInput:
+        read_share = self.cache_percent
+        return dh.HintInput(
+            shortfall_tokens=self.facts.shortfall_tokens,
+            misses=self.facts.misses,
+            cache_writes=self.cache_creation,
+            gaps_past_ttl=self.facts.gaps_past_ttl,
+            read_share=None if read_share is None else read_share / 100,
+            side_cost=self.side_cost,
+            subagent_cost=self.sub_cost,
+            cost=self.cost,
+        )
+
+    def hints(self) -> dict[str, str]:
+        return dh.hint_lines(self.hint_input())
+
     def add(self, request: Request) -> None:
         self.requests += 1
+        stamp = parse_timestamp(request.timestamp)
+        seconds = None if stamp is None else stamp.timestamp()
         fresh, output, read, created = request.tokens
         self.fresh += fresh
         self.output += output
@@ -365,17 +418,35 @@ class Session:
         if request.loop:
             self.iterations += 1
             self.sub_iterations += request.sub
+            if request.sub:
+                self.sub_cost += request.cost or 0.0
             self.models[request.model] += 1
             if request.effort:
                 self.efforts[request.effort] += 1
         else:
             self.side_requests += 1
             self.side_cost += request.cost or 0.0
+            if request.source == COMPACT_SOURCE and seconds is not None:
+                self.main_compaction_stamps.append(seconds)
             if request.source == HOOK_PROMPT:
                 self.hook_requests += 1
                 self.hook_cost += request.cost or 0.0
-        if (stamp := parse_timestamp(request.timestamp)) is not None:
-            self.stamps.append(stamp.timestamp())
+        if seconds is not None:
+            self.stamps.append(seconds)
+            if request.loop and request.event:
+                if request.sub and not request.agent_id:
+                    self.keyless_rows += 1  # not attributable to one subagent: no loop to compare within
+                else:
+                    self.cache_rows.append(
+                        dh.CacheRow(
+                            seconds,
+                            (request.agent_id or "") if request.sub else dh.MAIN_LOOP,
+                            read,
+                            created,
+                            request.cache_5m,
+                            request.cache_1h,
+                        )
+                    )
         if request.timestamp:
             self.first = min(self.first or request.timestamp, request.timestamp)
             self.last = max(self.last, request.timestamp)
@@ -385,10 +456,63 @@ class Session:
 class SessionReport:
     sessions: list[Session]
     unreadable: int = 0
+    mirrored: int = 0
 
     @property
     def uncosted(self) -> int:
         return sum(s.uncosted for s in self.sessions)
+
+
+def _tokens(values: tuple[float, ...]) -> cm.Tokens:
+    fresh, output, read, created = (int(v) for v in values)
+    return fresh, output, read, created
+
+
+def _miss_inputs(capture: Capture) -> tuple[dict[str, list[cm.Req]], dict[str, list[cm.Step]]]:
+    """Per session, the `api_request` events and native steps as the miss rule reads them. A record with no
+    usable timestamp is left out (it cannot be placed in a loop); every number was bounded by `as_number`."""
+    reqs: dict[str, list[cm.Req]] = defaultdict(list)
+    steps: dict[str, list[cm.Step]] = defaultdict(list)
+    for r in capture.requests:
+        when = parse_timestamp(r.timestamp)
+        if when is None:
+            continue
+        reqs[r.session].append(
+            cm.Req(
+                when.timestamp(),
+                r.source,
+                r.agent_id or "",
+                r.model,
+                r.effort or "",
+                _tokens(r.tokens),
+                None if r.cache_5m is None else int(r.cache_5m),
+                None if r.cache_1h is None else int(r.cache_1h),
+                r.cost or 0.0,
+                r.request_id or "",
+            )
+        )
+    for st in capture.steps:
+        when = parse_timestamp(st.timestamp)
+        if when is not None:
+            steps[st.session].append(cm.Step(when.timestamp(), st.agent, _tokens(st.tokens)))
+    return reqs, steps
+
+
+def _miss_compactions(chosen: list[Compaction]) -> dict[str, list[cm.Compaction]]:
+    """Per session: a main-loop compaction, a native subagent compaction (named by id), or an event one (named by
+    type, so it excuses every subagent loop of the session)."""
+    out: dict[str, list[cm.Compaction]] = defaultdict(list)
+    for c in chosen:
+        when = parse_timestamp(c.timestamp)
+        if when is None:
+            continue
+        if c.agent is None:
+            out[c.session].append(cm.Compaction(when.timestamp(), cm.MAIN))
+        elif c.native:
+            out[c.session].append(cm.Compaction(when.timestamp(), cm.AGENT, c.agent))
+        else:
+            out[c.session].append(cm.Compaction(when.timestamp(), cm.ANY_AGENT))
+    return out
 
 
 def build_report(capture: Capture) -> SessionReport:
@@ -397,7 +521,19 @@ def build_report(capture: Capture) -> SessionReport:
     sessions: dict[str, Session] = {}
     for request in [*capture.requests, *steps]:
         sessions.setdefault(request.session, Session(request.session)).add(request)
-    main, sub = count_compactions(select_compactions(capture.native_compactions, capture.event_compactions))
+    chosen = select_compactions(capture.native_compactions, capture.event_compactions)
+    main, sub = count_compactions(chosen)
+    for compaction in chosen:
+        when = parse_timestamp(compaction.timestamp)
+        if when is not None and compaction.session in sessions:
+            target = sessions[compaction.session]
+            (target.main_compaction_stamps if compaction.agent is None else target.agent_compaction_stamps).append(
+                when.timestamp()
+            )
+            if compaction.agent is not None and compaction.native:
+                target.native_agent_compactions += 1
+    miss_reqs, miss_steps = _miss_inputs(capture)
+    miss_compactions = _miss_compactions(chosen)
     peaks: dict[str, list[Sample]] = {}
     for sample in capture.samples:
         peaks.setdefault(sample.session, []).append(sample)
@@ -407,8 +543,14 @@ def build_report(capture: Capture) -> SessionReport:
         session.peak_context = None if peak is None else peak.percent
         session.compactions = main.get(session.session, 0)
         session.subagent_compactions = sub.get(session.session, 0)
+        session.facts = dh.cache_facts(
+            session.cache_rows, session.main_compaction_stamps, session.agent_compaction_stamps
+        )
+        session.misses = cm.analyse(
+            miss_reqs.get(session.session, []), miss_steps.get(session.session, []), miss_compactions[session.session]
+        )
     ordered = sorted(sessions.values(), key=lambda s: (s.last, s.session), reverse=True)
-    return SessionReport(ordered, capture.unreadable)
+    return SessionReport(ordered, capture.unreadable, capture.mirrored)
 
 
 # --- formatting --------------------------------------------------------------------
@@ -508,6 +650,62 @@ def _hook_block(sessions: list[Session]) -> list[str]:
     ]
 
 
+HINT_TITLES = {
+    "shortfall": f"read short of the cache (shortfall over cache writes at {dh.SHORTFALL_SHARE_MIN:.2f} or more)",
+    "gaps": f"gaps past the cache lifetime ({dh.GAPS_PAST_TTL_MIN} or more, lifetime known)",
+    "read": f"cache read share of input tokens (below {dh.READ_SHARE_BELOW:.2f})",
+    "side": f"side-request cost share ({dh.SIDE_SHARE_MIN:.3f} or more)",
+    "subagent": f"subagent cost share ({dh.SUBAGENT_SHARE_MIN:.3f} or more)",
+}
+
+
+def _hint_block(sessions: list[Session], shown: list[Session]) -> list[str]:
+    """One line per hint that fires on a shown session, then on how many of all sessions each fires."""
+    lines = [f"  {tr.session_label(s.session)}  {hint}" for s in shown for hint in s.hints().values()]
+    fired = Counter(key for s in sessions for key in s.hints())
+    unknown = sum(s.facts.gaps_unknown for s in sessions)
+    keyless = sum(s.keyless_rows for s in sessions)
+    out = [
+        (
+            "Decision hints (each names a cost in the capture, not a verdict; the bars are drawn from one capture's"
+            " distribution and are a hypothesis)"
+        ),
+        *(lines or ["  none fired on the sessions shown"]),
+        f"  fires on, of {plural(len(sessions), 'session')}:",
+        *(f"    {HINT_TITLES[key]}: {fired[key]:,}" for key in dh.HINTS),
+    ]
+    if unknown:
+        out.append(
+            f"  {plural(unknown, 'main-loop gap')} over 5 min with no cache lifetime known (not in the gap hint)"
+        )
+    if keyless:
+        out.append(f"  {plural(keyless, 'subagent request')} without agent_id left out of the shortfall and gap hints")
+    if any(s.native_agent_compactions for s in sessions):
+        out.append(
+            "  a native subagent compaction excuses every agent loop of its session in the hints, but only that agent"
+            " in the cache misses below: the two miss counts can differ"
+        )
+    return out
+
+
+def _miss_block(sessions: list[Session], shown: list[Session]) -> list[str]:
+    """Cache misses: the total block over every session, then the headline-loop figures of each shown session."""
+    total = cm.Analysis()
+    for s in sessions:
+        total.add(s.misses)
+    per_session = [
+        f"  {tr.session_label(s.session)}  {line}" for s in shown if (line := cm.session_line(s.misses)) is not None
+    ]
+    return [
+        (
+            "Cache misses (a request read short of the previous request's read plus write by more than 5% and at least"
+            ' 2,000 tokens, no compaction in between; "followed" is what the capture shows before a miss, not why)'
+        ),
+        *cm.summary_lines(total),
+        *(["  per session shown, main and agent_id loops:", *per_session] if per_session else []),
+    ]
+
+
 def format_report(report: SessionReport, limit: int | None = None) -> str:
     sessions = report.sessions
     if not sessions:
@@ -529,6 +727,8 @@ def format_report(report: SessionReport, limit: int | None = None) -> str:
     hook = _hook_block(sessions)
     if hook:
         blocks.append(hook)
+    blocks.append(_hint_block(sessions, shown))
+    blocks.append(_miss_block(sessions, shown))
     notes = []
     if report.uncosted:
         notes.append(f"  {plural(report.uncosted, 'request')} without cost (left out of cost)")
@@ -541,6 +741,8 @@ def format_report(report: SessionReport, limit: int | None = None) -> str:
         notes.append(f"  {plural(subagent, 'subagent compaction')} not counted in compact (it counts the main loop)")
     if report.unreadable:
         notes.append(f"  {unreadable_note(report.unreadable)}")
+    if report.mirrored:
+        notes.append(f"  mirrored requests counted once: {report.mirrored}")
     if notes:
         blocks.append(["Notes", *notes])
     return "\n\n".join("\n".join(block) for block in blocks)

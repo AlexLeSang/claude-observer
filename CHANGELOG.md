@@ -6,6 +6,62 @@ All notable changes to the `usage-observer` plugin. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-05
+
+New views for deciding how to use Claude: your costliest prompts, failing hooks and tool errors, per-session decision
+hints with a cache-miss breakdown, and a quota pace line. The plugin records two new things, each prompt's origin kind
+and the latest rate-limit reading, and never their text. No record shape was removed or changed: existing captures
+keep working.
+
+### Added
+
+- `report --prompts` (and a `prompts` view for the `usage-reflection` skill) ranks your costliest prompts with the
+  cost of the subagents each one dispatched rolled up, instead of charging a background subagent to whatever you
+  typed next. Subagent cost that cannot be tied to a prompt is shown apart, with coverage, a per-version table and
+  two checks. `--json` prints the same figures with full ids; it never prints prompt text.
+- The plugin records the origin kind of each submitted prompt (`composer`, `sdk`, `task-notification`,
+  `scheduled-trigger`, `peer` or `other`; never the prompt or the rest of its origin) as a `prompt_submit`
+  record, so a prompt you did not type can be labelled.
+- `report --friction` lists failing hook executions per hook and recurring tool error signatures (tool name and
+  error kind, never error text), and reads your transcripts to name the plugin behind each failed hook run and to
+  compare its count with the capture's. A transcript that cannot be read, or that ends on a cut-off line, is
+  counted and noted, never skipped silently. `--json` prints the same figures and `--limit N` caps the signature
+  table.
+- `report --sessions` prints decision hints under the table: cache reads short of the cache, gaps longer than the
+  cache lifetime, a low cache-read share, and a large side-request or subagent share of cost. Each hint says what
+  it counted.
+- The plugin records the account's rate-limit percentages and reset times in `~/.claude/observer/quota-latest.json`
+  (percentages and times only). `scripts/quota_latest.py` prints them with their age and `scripts/quota_report.py
+  --pace` shows used share against elapsed share of each window. For the five-hour window it adds one plain linear
+  line, labelled as arithmetic ("at this pace you reach N% at reset / 100% at HH:MM UTC"), with the backtest result
+  beside it: on 37 five-hour windows no method beat assuming no growth, and this pace overshot, so on them it was worse
+  than no growth. It prints "no line" where the arithmetic would be wrong.
+
+- `report --sessions` ends with a "Cache misses" block: requests that read short of the previous request's cache
+  read plus write, per loop (the main thread, and one loop per subagent `agent_id`), with what each miss followed (a
+  model switch, a gap past the cache lifetime, an effort change, else unexplained), counts, tokens and an estimated
+  dollar shortfall. A subagent request without an `agent_id` is matched to the one native step with the same token
+  counts within 120 seconds; those misses are labelled a lower bound and kept out of the totals, and requests that
+  match no step are counted as not attributable.
+
+### Changed
+
+- `report --json` is refused (exit 2) when `--sessions`, `--tickets` or `--digest` would override the view.
+
+- The `sessions` hint block says when a session has a subagent compaction, because the hints excuse every loop of
+  such a session and the cache-miss block only that agent.
+
+### Fixed
+
+- `report --friction` refuses a transcript that is a symlink or not a regular file (a FIFO no longer hangs it) and
+  counts it as unreadable. An error count it cannot read now counts as unreadable instead of being skipped silently.
+- The plugin's install check names every script the appender imports (`quota_latest.py`, `instant_util.py` and
+  `safe_name.py` were missing), so a partial install is reported.
+- `report --sessions` counts a mirrored request once, not twice.
+- `quota_report.py --pace` counts elapsed time and the linear line from the time of the reading, not from now, and
+  `--json` output of `report --prompts` rounds its figures to six places.
+- The `prompts` spawn-depth legend states that a broken chain counts the spawns found.
+
 ## [0.5.0] - 2026-10-31
 
 First public release, under the MIT license. Numbering stays at 0.x for now; 1.0.0 will come with a

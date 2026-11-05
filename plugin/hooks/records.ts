@@ -98,7 +98,9 @@ export const REPORT_VIEWS: readonly string[] = [
   'skills',
   'plugins',
   'digest',
+  'prompts',
   'personas', // the old name of subagents, still accepted
+  'friction',
 ]
 
 const PLUGIN_FILE_MAX = 128
@@ -254,6 +256,18 @@ export function composeRecord(
     sections: result.sections.map(s => ({ id: s.id, scope: s.scope, chars: s.text.length })),
     chars: result.sections.reduce((sum, s) => sum + s.text.length, 0),
   }
+}
+
+// Who authored a submitted main-loop prompt. Only the engine's own kinds are kept; any other value is
+// `other`, so a name an SDK caller made up never reaches the capture.
+const PROMPT_ORIGINS: readonly string[] = ['composer', 'sdk', 'task-notification', 'scheduled-trigger', 'peer']
+
+// One prompt submission: the kind of its origin (null when the engine sent none), never the prompt text
+// or any other field of the origin.
+export function promptSubmitRecord(e: { origin?: { kind?: unknown } | null }) {
+  const kind = e.origin?.kind
+  if (kind === undefined || kind === null) return { origin: null }
+  return { origin: typeof kind === 'string' && PROMPT_ORIGINS.includes(kind) ? kind : 'other' }
 }
 
 type AttachmentInput = {

@@ -41,7 +41,9 @@ VIEWS = (
     "skills",
     "plugins",
     "digest",
+    "prompts",
     "personas",
+    "friction",
 )
 # `personas` is the old name of `subagents`, kept so existing calls still run; it is run, and
 # printed in the `view:` line, as `subagents`.

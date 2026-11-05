@@ -8,7 +8,9 @@ cost. Nothing leaves your machine.
 
 Per session, one JSON line each for: session start and end, turns, model requests (model, token counts
 by type, cost), tool calls (tool name, outcome, sizes), skill activations, subagent dispatches and
-offers (type, model, sizes), compactions, context and prompt sizes, hook time, and the OTel events
+offers (type, model, sizes), compactions, context and prompt sizes, the origin kind of each submitted prompt
+(`composer`, `sdk`, `task-notification`, `scheduled-trigger`, `peer` or `other`; never the prompt or the rest of
+its origin), hook time, and the OTel events
 Claude Code itself emits, mirrored.
 
 - **Metadata only.** The plugin's own records carry names, sizes, counts, token usage, subagent id and
@@ -21,7 +23,12 @@ Claude Code itself emits, mirrored.
   also dropped when `OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_TOOL_DETAILS` or `OTEL_LOG_TOOL_CONTENT` is
   set), and any attribute that is not a string, number, boolean or list of strings. An attribute
   under another name is kept, so the capture can hold whatever else Claude Code puts in its events.
-- **Local only.** The plugin makes no network call. It appends to
+- **Quota readings.** A `measure` record carries `rate_limits`: per window its `kind`, `percent` and, when the engine
+  sends it, `resets_at`. The newest reading is also written to one per-machine file,
+  `~/.claude/observer/quota-latest.json` (mode 0600; account percentages and reset times only, no session, project
+  or path). `scripts/quota_latest.py` prints it with its age and a `fresh`, `stale` or `reset` state per window, and
+  `scripts/quota_report.py --pace` shows used % against elapsed %. Neither runs `claude` or opens a socket.
+- **Local only.** The plugin makes no network call. Besides the capture it writes the one quota file named above and its `quota-latest.json.lock` sidecar. It appends to
   `logs/agent-telemetry.mod.jsonl` under the project's main checkout (change it with the `capture`
   plugin option). The file is created mode 0600 in a 0700 directory, rotated by size and pruned by
   age. If git does not already ignore it, the plugin adds it to the repository's local
@@ -53,7 +60,7 @@ only released versions). To follow releases only, or to pin one, add a ref after
 
 ```bash
 claude plugin marketplace add alexlesang/claude-observer#stable
-claude plugin marketplace add alexlesang/claude-observer#usage-observer--v0.5.0
+claude plugin marketplace add alexlesang/claude-observer#usage-observer--v0.6.0
 ```
 
 Update with `claude plugin update usage-observer@usage-observer`, then `/reload-plugins`.
@@ -84,7 +91,7 @@ output also lists a "gating hook without .catch" notice for ten of the hooks; th
 below are complete):
 
 ```
-./observer.ts hooks: classic.SessionStart, command.run{command=observer}, ui.render{component=Pane, requestId=usage-observer}, session.start, session.end, classic.*, plugin.register, classic.UserPromptSubmit, classic.SubagentStart, agent.spawn, agent.offer, turn.start, turn.step, turn.complete, tool.call, skill.prompt, prompt.compose, prompt.context, prompt.attachment, tool.describe, session.compact, session.measure, telemetry.log{to=collector}
+./observer.ts hooks: classic.SessionStart, command.run{command=observer}, ui.render{component=Pane, requestId=usage-observer}, session.start, session.end, classic.*, plugin.register, classic.UserPromptSubmit, prompt.submit, classic.SubagentStart, agent.spawn, agent.offer, turn.start, turn.step, turn.complete, tool.call, skill.prompt, prompt.compose, prompt.context, prompt.attachment, tool.describe, session.compact, session.measure, telemetry.log{to=collector}
 ./observer.ts calls: $.agent.list (via agentType), $.clock.every, $.clock.sleep (via announce, flush), $.command.register, $.env.get (via isCloudSession), $.fs.exists (via checkInstall), $.process.run (via checkInstall, flushNow, resolveHome, runReports), $.session.id, $.session.model (via pushAnnounce), $.session.root (via resolveHome), $.session.version (via pushAnnounce), $.settings.read (via pushAnnounce), $.state.get, $.state.set, $.store.get (via announcedIds), $.store.set (via heartbeat, markAnnounced, unannounce), $.ui.open, $.ui.resolve, $.ui.toast (via warnOnce)
 ./observer.ts env writes: nothing
 ./observer.ts env reads: CLAUDE_CODE_REMOTE
@@ -109,7 +116,14 @@ scripts. It has no `$.http` call.
 - **Reports**, from the bundled `usage-reflection` skill or by hand from the project directory:
   `python3 -B <plugin root>/scripts/reflect_report.py <view> [--limit N]`, where `<view>` is one of
   `sessions`, `subagents`, `models`, `tickets` (needs a kanban board), `context`, `fixed-context`,
-  `skills`, `plugins`, `digest`. (`personas` is the old name of `subagents` and still runs.) The first
+  `skills`, `plugins`, `friction`, `digest`, `prompts`. `prompts` ranks your costliest prompts with the cost of the
+  subagents each dispatched; `friction` lists failing hook runs and recurring tool error signatures (tool name and
+  error kind, never error text, and it reads transcripts to name the plugin behind a failed hook); `sessions` adds
+  decision hints and a cache-miss block (counts, tokens and dollars; subagent requests matched by token counts to a
+  native step are labelled a lower bound). The same views are flags of `scripts/agent_telemetry.py report`.
+  Quota pace is `scripts/quota_report.py --pace`: used % against elapsed %, and for the five-hour window one linear
+  line labelled arithmetic, not a prediction, with its backtest beside it (37 windows, no method beat assuming no
+  growth, this pace overshot). (`personas` is the old name of `subagents` and still runs.) The first
   output line names the capture each number came from. A line `warning: --all-projects reads every
   project's data in the capture` only means no project label was found, so the whole file is read;
   the file is already this project's own.

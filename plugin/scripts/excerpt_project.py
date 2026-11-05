@@ -9,7 +9,7 @@ The excerpt is text a user posts publicly, so this module is built to hold NO fr
   "any number": `agent_spawn.ticket` is a ticket id and is not in the table), a boolean, an element of a fixed set
   (a string outside the set becomes `other`), a model or version string that matched a strict pattern (else
   `other`), a pseudonym `<category>-N` (built-in names of a fixed set are kept), a count (the length of a list), or
-  a time cut to the minute. A value of the wrong type is dropped.
+  a time cut to the minute (`rate_limits[].resets_at`: UTC, seconds dropped, from `instant_util`'s strict parser). A value of the wrong type is dropped.
 * A record of an unknown kind, an OTel mirror record (no `kind`; `{ts, path, source, payload}`; dropped whole), a
   line that is not a JSON object, a line over `MAX_LINE`, a repeated key, NaN and a nested-too-deep line are
   counted and never shown.
@@ -28,6 +28,8 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
+
+from instant_util import parse_instant
 
 MAX_LINE = 64 * 1024  # a longer line is counted, never parsed
 MAX_NUM = 10**12
@@ -57,6 +59,7 @@ END_REASONS = frozenset({"clear", "resume", "logout", "prompt_input_exit", "bypa
 SHAPES = frozenset({"fresh", "fork", "teammate"})
 TRIGGERS = frozenset({"manual", "auto", "plugin"})
 ORIGINS = frozenset({"engine", "hook", "plugin"})
+PROMPT_ORIGINS = frozenset({"composer", "sdk", "task-notification", "scheduled-trigger", "peer"})
 DEFINITIONS = frozenset(
     {
         "built-in",
@@ -103,7 +106,9 @@ REPORT_VIEWS = frozenset(
         "skills",
         "plugins",
         "digest",
+        "prompts",
         "personas",
+        "friction",
     }
 )
 PROVENANCES = frozenset({"@inline", "@builtin"})
@@ -281,7 +286,20 @@ _USAGE_TABLE: dict[str, tuple[str, Any]] = {
     "cache_creation_input_tokens": ("cache_creation_input_tokens", num),
     "model": ("model", model),
 }
-_RATE_TABLE: dict[str, tuple[str, Any]] = {"kind": ("kind", enum(RATE_KINDS)), "percent": ("percent", flt)}
+
+
+def instant(_names: Names, value: object) -> object:
+    """An ISO instant with a zone, as UTC cut to the minute (`...T14:30:00Z`; the stable weekly reset instant must
+    not be exact enough to link posts); anything else is dropped."""
+    got = parse_instant(value)
+    return DROP if got is None else got.strftime("%Y-%m-%dT%H:%M:00Z")
+
+
+_RATE_TABLE: dict[str, tuple[str, Any]] = {
+    "kind": ("kind", enum(RATE_KINDS)),
+    "percent": ("percent", flt),
+    "resets_at": ("resets_at", instant),
+}
 usage = _sub(_USAGE_TABLE)
 
 
@@ -366,6 +384,9 @@ KINDS: dict[str, Table] = {
         "tool_count": ("tool_count", num),
         "sections": ("sections_count", count),
         "chars": ("chars", num),
+    },
+    "prompt_submit": {
+        "origin": ("origin", enum(PROMPT_ORIGINS)),
     },
     "prompt_context": {
         "blocks": ("blocks_count", count),

@@ -32,7 +32,7 @@ Without a ref, `marketplace add` follows the repository's default branch, `stabl
 versions only (`main` is development). To pin a release or pick a branch, add a ref after `#`:
 
 ```bash
-claude plugin marketplace add alexlesang/claude-observer#usage-observer--v0.5.0
+claude plugin marketplace add alexlesang/claude-observer#usage-observer--v0.6.0
 ```
 
 Update with `claude plugin update usage-observer@usage-observer`, then `/reload-plugins`.
@@ -82,8 +82,10 @@ The views are:
 
 | View | Shows |
 | --- | --- |
-| `sessions` | One row per session: cost, tokens, cache hit rate, models and effort, peak context, compactions |
+| `sessions` | One row per session: cost, tokens, cache hit rate, models and effort, peak context, compactions; under the table, decision hint lines (cache reads short of the cache, gaps longer than the cache lifetime, a low cache-read share, a large side-request or subagent share of cost), each naming what it counted (tokens, gaps, a share or a cost), never an outcome; then a "Cache misses" block: requests that read short of the previous request's cache read plus write, by loop (main thread, one per subagent id), with what each miss followed (a model switch, a gap past the cache lifetime, an effort change, else unexplained). Subagent requests without an id are matched to a native step by their token counts; that row is labelled a lower bound and kept out of the totals |
 | `subagents` | Usage per subagent type: tokens, cost, iterations, tool use |
+| `prompts` | Costliest prompts with the cost of the subagents each one dispatched rolled up; subagent cost that cannot be tied to a prompt is shown apart, with coverage |
+| `friction` | Failing hook executions per hook and recurring tool error signatures (names and error kinds, never error text); transcripts name the plugin behind a failed hook run |
 | `models` | Model and effort comparison: iterations, output tokens, cost, stop reasons |
 | `tickets` | Cost per ticket; needs a task board of Markdown files in the project (`plugin/README.md` names the folder); without one it exits 3 with a message saying so |
 | `context` | Context fill over time and what each compaction re-created |
@@ -91,6 +93,14 @@ The views are:
 | `skills` | Skill activations and each skill's load overhead |
 | `plugins` | Loaded plugins, session cost with and without each, hook overhead |
 | `digest` | A Markdown summary of the last 7 days, printed to the terminal |
+
+Quota pace is a separate script: `python3 -B <plugin root>/scripts/quota_report.py --pace` shows, per rate-limit
+window, the percent used next to the percent of the window that has elapsed, from the latest reading on this
+machine (`scripts/quota_latest.py` prints that reading with its age). For the five-hour window it adds one plain linear
+line, "at this pace you reach N% at reset / 100% at HH:MM UTC", labelled as arithmetic and not a prediction, with the
+backtest result printed beside it: on 37 five-hour windows no method beat assuming no growth, and this pace overshot.
+
+The same views are flags of `python3 -B <plugin root>/scripts/agent_telemetry.py report` (`--sessions`, `--prompts`, `--friction`; `--json` applies to `--friction` and `--prompts` only, `report --sessions --json` exits 2).
 
 `personas` is an older name of `subagents` and gives the same output. The first output line names the capture each number came from. A line saying `--all-projects reads every
 project's data in the capture` only means no project label was found, so the whole file is read; the file is
@@ -145,18 +155,32 @@ happy with every line. The `--keep` flag leaves the scrubbed, unprojected workin
 
 - **What is captured.** One JSON line per event: session start and end, turns, model requests (model, token
   counts by type, cost), tool calls (tool name, outcome, sizes), skill activations, subagent dispatches (type,
-  model, sizes), compactions, context and prompt sizes, hook time, and the OpenTelemetry events Claude Code
-  itself emits, mirrored.
+  model, sizes), compactions, context and prompt sizes, the origin kind of each submitted prompt (`composer`,
+  `sdk`, `task-notification`, `scheduled-trigger`, `peer` or `other`), hook time, the account's rate-limit
+  percentages with their reset times, and the OpenTelemetry events Claude Code itself emits, mirrored.
 - **What is never captured by the plugin's own records.** Prompt text, tool input, tool output, a subagent's
-  prompt or description, a hook's command or output. Identity attributes of the mirrored events (email,
+  prompt or description, a hook's command or output, and no part of a prompt's origin beyond its kind. The
+  reports `prompts` and `friction` add none: they name prompts by session, time and id, never by text, and tool
+  errors by tool name and error kind, never by error text. The `sessions` hints and cache-miss block print counts,
+  token sums, dollars and shortened session ids only. The `prompt_submit` record holds the origin kind and
+  nothing else of the prompt. Identity attributes of the mirrored events (email,
   account and organization ids, repository owner, name and URL) are dropped by name.
 - **Where it goes.** `logs/agent-telemetry.mod.jsonl` in the project's main checkout, created mode 0600 in a
   0700 directory, rotated by size and pruned by age. If git does not already ignore it, the plugin adds it to
   the repository's local `.git/info/exclude` (never a tracked file). Change the path with the `capture`
   plugin option.
+- **One file outside the project.** The newest rate-limit reading (percentages and reset times only: no session,
+  project, path, hostname, username, email or text) is also written to `~/.claude/observer/quota-latest.json`,
+  mode 0600, one per machine, with a `quota-latest.json.lock` sidecar. `scripts/quota_latest.py` and
+  `quota_report.py --pace` read it; neither runs `claude` or opens a socket.
 - **Reports read more than the capture.** Some views also open this project's session transcripts under
-  `~/.claude/projects/`, and your Claude settings files, to name subagents and plugins. They print counts and
-  names and send nothing anywhere.
+  `~/.claude/projects/`, and your Claude settings files, to name subagents and plugins (`friction` also reads
+  transcripts to name the plugin behind a failed hook run, and refuses a transcript that is a symlink or not a
+  regular file). The views in the table above and `report --sessions`, `--prompts` and `--friction` print counts and names
+  (the runner's first line also names the capture file's path), never prompt text, tool input or output, or error text.
+  The exception is `report --failures`: it joins failed tool calls to the transcripts and prints each call's tool
+  input and error text, so treat its output like session text. `--reasoning` reads transcripts too but
+  prints counts only (`--tools` reads only the capture). None of these sends anything anywhere.
 - **Scrubbing is a filter, not a guarantee.** Records are cleaned by attribute name, in key-style spellings.
   An attribute under another name is kept, so the capture can hold whatever else Claude Code puts in its
   events, and free text that holds a value in an unusual shape is written as it is. Names you chose (session
