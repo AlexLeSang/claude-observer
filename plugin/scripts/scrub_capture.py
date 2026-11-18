@@ -19,7 +19,7 @@ It removes keys in dicts and lists, and inside JSON text held in an OTLP `string
 (an earlier appender wrote a dict-valued OTel attribute as a JSON string): such text is parsed and cleaned by `mca.drop_sensitive`, and text that is too
 deep or cut short while naming a sensitive key counts as unscrubbed. It also removes the OTLP
 attribute entries named in `CONTENT_ATTRIBUTES` (`prompt`, `prompt_text`, `response`,
-`tool_*`) wherever they sit in an attribute list; a plain field of a
+`tool_*`, `error`) wherever they sit in an attribute list; a plain field of a
 native record with one of those names is left alone. JSON text in any string value is cleaned
 the same way (text serialized twice, a BOM or space before it, a key with space around it); a
 name used as a key in text that is not JSON as a whole counts as unscrubbed. The text
@@ -43,9 +43,9 @@ import os
 import re
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import agent_telemetry as at
 import mod_capture_append as mca
@@ -83,7 +83,7 @@ def torn_line_is_sensitive(line: str) -> bool:
     text search reads it; text that cannot be searched counts. The scrub replaces every such line by
     `TORN_MARKER` whatever this says: it tells the read-only check which of them held a name."""
     try:
-        return mca._names_a_key(line)  # noqa: SLF001
+        return mca._names_a_key(line)  # noqa: SLF001  (the scrub and the read-only check share mca's one key test, not a copy)
     except mca.UncheckableError:
         return True
 
@@ -117,7 +117,7 @@ def _cannot_scrub(line: str) -> str:
     hold no identity or content is one with nothing of the original left (this replaced an earlier
     keep-every-line rule). The marker is not JSON, so the count of records is unchanged. It
     counts as blanked; a marker from an earlier run is left as it is and not counted again."""
-    global _blanked  # noqa: PLW0603
+    global _blanked  # noqa: PLW0603  (module counter the one-shot CLI and _scrub_file read by difference)
     if line == TORN_MARKER:
         return line
     _blanked += 1
@@ -148,77 +148,111 @@ def _scrub_piece(line: str) -> str:
     return bom + (rest if not rest.strip() else _scrub_record(rest))  # blank pieces: nothing to scrub
 
 
-def _scrub_record(line: str) -> str:
-    global _unscrubbed  # noqa: PLW0603
+def _parse_record(line: str) -> dict[str, Any] | None:
+    """The line as a JSON object, or None when it is not valid JSON or not an object. A line too deep for the parser
+    (`RecursionError`) or repeating a key (`DuplicateKeyError`) raises."""
     try:
-        try:
-            record = json.loads(line, object_pairs_hook=_object)
-        except json.JSONDecodeError:
+        record = json.loads(line, object_pairs_hook=_object)
+    except json.JSONDecodeError:
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _clean_line(line: str, record: dict[str, Any]) -> str:
+    """The parsed record without its identity and content entries, as the line to write."""
+    global _unscrubbed  # noqa: PLW0603  (module counter the one-shot CLI and _scrub_file read by difference)
+    clean = drop_content(
+        mca.drop_identity_keys(at.drop_identity(mca.without_entry_record(record)))
+    )  # as mca.clean_record, counting
+    if clean == record:
+        return line
+    try:
+        return json.dumps(clean, allow_nan=False, ensure_ascii=mca.ensure_ascii())
+    except ValueError:  # nan or infinity (1e999) has no JSON form, and `clean != record`
+        _unscrubbed += 1  # proves a sensitive entry is in the line, whatever spelling its key has
+        return line
+
+
+def _keep_or_blank(line: str) -> str:
+    """A line the scrub could not walk. A line that is not one complete object is torn (a crash cut it), an array
+    or two records fused, and nothing of it is kept, like any torn line; a complete one is kept and counted."""
+    global _unscrubbed  # noqa: PLW0603  (module counter the one-shot CLI and _scrub_file read by difference)
+    if _is_one_object(line):
+        _unscrubbed += 1
+        return line
+    return _cannot_scrub(line)
+
+
+def _scrub_record(line: str) -> str:
+    try:
+        record = _parse_record(line)
+        if record is None:
             return _cannot_scrub(line)
-        if not isinstance(record, dict):
-            return _cannot_scrub(line)
-        clean = drop_content(
-            mca.drop_identity_keys(at.drop_identity(mca.without_entry_record(record)))
-        )  # as mca.clean_record, counting
-        if clean == record:
-            return line
-        try:
-            return json.dumps(clean, allow_nan=False, ensure_ascii=mca.ensure_ascii())
-        except ValueError:  # nan or infinity (1e999) has no JSON form, and `clean != record`
-            _unscrubbed += 1  # proves a sensitive entry is in the line, whatever spelling its key has
-            return line
-    except RecursionError:
-        # Too deep for the parser. A line that is not one complete object is torn (a crash cut it) or not a
-        # record, and nothing of it is kept, like any torn line; a complete one is kept and counted.
-        if _is_one_object(line):
-            _unscrubbed += 1
-            return line
-        return _cannot_scrub(line)
-    except ValueError:
-        # A repeated key (the shadowed copy cannot be seen) or text the walk refuses. A complete object is kept and
-        # counted; a line that is not one (torn, an array, two records fused) holds nothing back.
-        if _is_one_object(line):
-            _unscrubbed += 1
-            return line
-        return _cannot_scrub(line)
+        return _clean_line(line, record)
+    except (RecursionError, ValueError):
+        # Too deep for the parser, a repeated key (the shadowed copy cannot be seen) or text the walk refuses.
+        return _keep_or_blank(line)
 
 
 _CLOSER = {"{": "}", "[": "]"}
 _JSON_SPACE = " \t\n\r"
 
 
+@dataclass
+class _BracketScan:
+    """The state of `_is_one_object`'s walk: the closers still owed, and whether it is inside a string."""
+
+    stack: list[str] = field(default_factory=list)
+    in_string: bool = False
+    escaped: bool = False
+    started: bool = False
+
+    def feed(self, char: str) -> bool:
+        """Take one character; False when the text cannot be exactly one complete object."""
+        if self.in_string:
+            self._in_string(char)
+            return True
+        if not self.stack and self.started:
+            return char in _JSON_SPACE
+        if char == '"':
+            return self._open_string()
+        if char in _CLOSER:
+            return self._open_bracket(char)
+        if char in "}]":
+            return bool(self.stack) and self.stack.pop() == char
+        return bool(self.stack) or char in _JSON_SPACE
+
+    def _in_string(self, char: str) -> None:
+        if self.escaped:
+            self.escaped = False
+        elif char == "\\":
+            self.escaped = True
+        elif char == '"':
+            self.in_string = False
+
+    def _open_string(self) -> bool:
+        if not self.stack:
+            return False
+        self.in_string = True
+        return True
+
+    def _open_bracket(self, char: str) -> bool:
+        if not self.stack and char != "{":
+            return False
+        self.stack.append(_CLOSER[char])
+        self.started = True
+        return True
+
+
 def _is_one_object(text: str) -> bool:
     """Whether `text` is, as far as brackets and quotes go, exactly one complete `{...}`: it starts with `{`,
     every bracket is matched, no string is left open and nothing follows the closing bracket. A loop, not a
     recursion, so a line of any depth is answered; the rest of JSON's syntax is not checked."""
-    stack: list[str] = []
-    in_string = escaped = started = False
+    scan = _BracketScan()
     for char in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-        elif not stack and started:
-            if char not in _JSON_SPACE:
-                return False
-        elif char == '"':
-            if not stack:
-                return False
-            in_string = True
-        elif char in _CLOSER:
-            if not stack and char != "{":
-                return False
-            stack.append(_CLOSER[char])
-            started = True
-        elif char in "}]":
-            if not stack or stack.pop() != char:
-                return False
-        elif not stack and char not in _JSON_SPACE:
+        if not scan.feed(char):
             return False
-    return started and not stack and not in_string
+    return scan.started and not scan.stack and not scan.in_string
 
 
 # What `surrogateescape` makes of one invalid byte, and any escaped surrogate (`\ud83d`) a line may hold.
@@ -270,7 +304,7 @@ def _reset_counts(blanked: int, unscrubbed: int) -> None:
 def _blank_line(line: bytes) -> bytes:
     """Last resort for a line the scrub raised on: a record becomes `{}` and anything else the marker, as
     `_cannot_scrub` does, both counted as blanked, so nothing of the line is kept. Never raises."""
-    global _blanked  # noqa: PLW0603
+    global _blanked  # noqa: PLW0603  (module counter the one-shot CLI and _scrub_file read by difference)
     if _is_record(line):
         _blanked += 1
         return b"{}"
@@ -299,6 +333,82 @@ def _split(raw: bytes) -> list[bytes]:
     return lines
 
 
+def _scrub_numbered(lines: list[bytes], first: int, failed_lines: list[int], blanked_lines: list[int]) -> list[bytes]:
+    """The scrubbed lines; the numbers (from `first`) of those that were blanked or left unscrubbed are added to
+    the two lists."""
+    scrubbed = []
+    for number, line in enumerate(lines, first):
+        clean, was_blanked, failed = scrub_bytes_noted(line)
+        scrubbed.append(clean)
+        if was_blanked:
+            blanked_lines.append(number)
+        if failed:
+            failed_lines.append(number)
+    return scrubbed
+
+
+def _result(
+    shown: Path,
+    counts: tuple[int, int, int],
+    notes: tuple[int, int],
+    failed_lines: list[int],
+    blanked_lines: list[int],
+) -> ScrubResult:
+    """The `ScrubResult` from (before, after, changed), (unscrubbed, blanked) and the two line-number lists."""
+    return ScrubResult(
+        shown,
+        counts[0],
+        counts[1],
+        counts[2],
+        notes[0],
+        tuple(failed_lines[:LISTED_LINES]),
+        notes[1],
+        tuple(blanked_lines[:LISTED_LINES]),
+    )
+
+
+def _swap_in(path: Path, handle: BinaryIO, size: int, output: bytes) -> None:
+    """Replace `path` by `output` atomically, mode 0600 and times kept; raises `ScrubError` when the file is no
+    longer the one that was read."""
+    stat = os.fstat(handle.fileno())
+    try:
+        now = path.stat()
+    except FileNotFoundError:
+        now = None
+    if now is None or (now.st_dev, now.st_ino) != (stat.st_dev, stat.st_ino) or now.st_size != size:
+        raise ScrubError(f"{path} changed during the pass; nothing written")
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".scrub-")
+    try:
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(output)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        Path(tmp_name).chmod(0o600)
+        # A rotated file's mtime is its newest record (prune_rotated), so keep it.
+        os.utime(tmp_name, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        os.replace(tmp_name, path)  # noqa: PTH105  (Path.replace binds os.replace early on 3.10; tests patch it)
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
+
+
+def _append_late(
+    path: Path, late: bytes, already: int, failed_lines: list[int], blanked_lines: list[int]
+) -> tuple[int, int]:
+    """Scrub the records a writer appended to the old file during the pass and append them to the new one. Returns
+    how many lines were left unscrubbed and how many were blanked; raises `ScrubError` when the append fails."""
+    late_lines = _split(late)
+    count, blanked_at = _unscrubbed, _blanked
+    tail = b"".join(clean + b"\n" for clean in _scrub_numbered(late_lines, already + 1, failed_lines, blanked_lines))
+    unscrubbed, blanked = _unscrubbed - count, _blanked - blanked_at
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND)
+        with os.fdopen(fd, "ab") as out:
+            out.write(tail)
+    except OSError as error:
+        raise ScrubError(_late_tail_message(path, path.name, tail, len(late_lines), unscrubbed, error)) from error
+    return unscrubbed, blanked
+
+
 def _scrub_file(shown: Path, dry_run: bool) -> ScrubResult:
     path = shown.resolve()  # a symlinked capture is rewritten in place at its target, not replaced by a file
     with path.open("rb") as handle:
@@ -306,89 +416,30 @@ def _scrub_file(shown: Path, dry_run: bool) -> ScrubResult:
         raw = handle.read(size)
         lines = _split(raw)
         failed_before, blanked_before = _unscrubbed, _blanked
-        scrubbed = []
         failed_lines: list[int] = []
         blanked_lines: list[int] = []
-        for number, line in enumerate(lines, 1):
-            clean, was_blanked, failed = scrub_bytes_noted(line)
-            scrubbed.append(clean)
-            if was_blanked:
-                blanked_lines.append(number)
-            if failed:
-                failed_lines.append(number)
+        scrubbed = _scrub_numbered(lines, 1, failed_lines, blanked_lines)
         unscrubbed = _unscrubbed - failed_before
         blanked = _blanked - blanked_before
         changed = sum(1 for old, new in zip(lines, scrubbed, strict=False) if old != new)
         if not dry_run:
             os.fchmod(handle.fileno(), 0o600)
         if dry_run or not changed:
-            return ScrubResult(
-                shown,
-                len(lines),
-                len(scrubbed),
-                changed,
-                unscrubbed,
-                tuple(failed_lines[:LISTED_LINES]),
-                blanked,
-                tuple(blanked_lines[:LISTED_LINES]),
-            )
+            counts = (len(lines), len(scrubbed), changed)
+            return _result(shown, counts, (unscrubbed, blanked), failed_lines, blanked_lines)
         output = b"".join(line + b"\n" for line in scrubbed)
         after = _split(output)
         if len(after) != len(lines) or sum(map(_is_record, after)) != sum(map(_is_record, lines)):
             raise ScrubError(f"{path}: the record count would change; nothing written")
-        stat = os.fstat(handle.fileno())
-        try:
-            now = path.stat()
-        except FileNotFoundError:
-            now = None
-        if now is None or (now.st_dev, now.st_ino) != (stat.st_dev, stat.st_ino) or now.st_size != size:
-            raise ScrubError(f"{path} changed during the pass; nothing written")
-        fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".scrub-")
-        try:
-            with os.fdopen(fd, "wb") as tmp:
-                tmp.write(output)
-                tmp.flush()
-                os.fsync(tmp.fileno())
-            Path(tmp_name).chmod(0o600)
-            # A rotated file's mtime is its newest record (prune_rotated), so keep it.
-            os.utime(tmp_name, ns=(stat.st_atime_ns, stat.st_mtime_ns))
-            os.replace(tmp_name, path)  # noqa: PTH105  (Path.replace binds os.replace early on 3.10; tests patch it)
-        finally:
-            Path(tmp_name).unlink(missing_ok=True)
+        _swap_in(path, handle, size, output)
         # A writer that had the old file open can still append to it after the size
         # check above; carry those records over to the new file.
         late = handle.read()
     if late:
-        late_lines = _split(late)
-        count, blanked_at = _unscrubbed, _blanked
-        tail = b""
-        for number, line in enumerate(late_lines, len(lines) + 1):
-            clean, was_blanked, failed = scrub_bytes_noted(line)
-            tail += clean + b"\n"
-            if was_blanked:
-                blanked_lines.append(number)
-            if failed:
-                failed_lines.append(number)
-        unscrubbed += _unscrubbed - count
-        blanked += _blanked - blanked_at
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND)
-            with os.fdopen(fd, "ab") as out:
-                out.write(tail)
-        except OSError as error:
-            raise ScrubError(
-                _late_tail_message(path, path.name, tail, len(late_lines), _unscrubbed - count, error)
-            ) from error
-    return ScrubResult(
-        shown,
-        len(lines),
-        len(after),
-        changed,
-        unscrubbed,
-        tuple(failed_lines[:LISTED_LINES]),
-        blanked,
-        tuple(blanked_lines[:LISTED_LINES]),
-    )
+        more_unscrubbed, more_blanked = _append_late(path, late, len(lines), failed_lines, blanked_lines)
+        unscrubbed += more_unscrubbed
+        blanked += more_blanked
+    return _result(shown, (len(lines), len(after), changed), (unscrubbed, blanked), failed_lines, blanked_lines)
 
 
 def _late_tail_message(path: Path, name: str, tail: bytes, count: int, unscrubbed: int, error: OSError) -> str:

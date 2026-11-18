@@ -43,6 +43,7 @@ from agent_context_fill import (
     COMPACTION,
     Compaction,
     Sample,
+    agent_of,
     count_compactions,
     event_compaction_of,
     native_compaction_of,
@@ -108,10 +109,10 @@ class Request:
     cache_5m: float | None = None  # api_request `cache_creation_5m_tokens`
     cache_1h: float | None = None  # api_request `cache_creation_1h_tokens`
     event: bool = False  # an `api_request` event, not a native step
+    speed: str | None = None  # api_request `speed`; only the exact text fast is read as fast mode
 
 
 MAX_TICKET_DIGITS = 5
-MAX_TYPE_CHARS = 64
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,7 +121,7 @@ class Spawn:
     ticket id and the agent type, nothing else. Both come from an untrusted capture line."""
 
     ticket: str | None  # plain digit string, 1 to 5 digits, not 0
-    agent_type: str | None  # printable, at most MAX_TYPE_CHARS
+    agent_type: str | None  # printable, at most `safe_name.MAX_NAME_CHARS`
 
 
 def spawn_ticket(value: object) -> str | None:
@@ -158,7 +159,7 @@ def api_request_of(attrs: dict[str, Any]) -> Request:
         prompt=text_of(attrs.get("prompt.id")),
         model=text_of(attrs.get("model")),
         effort=tr.as_str(attrs.get("effort")),
-        tokens=tokens,  # type: ignore[arg-type]
+        tokens=tokens,  # type: ignore[arg-type]  # built from the four API_TOKEN_KEYS, which mypy sees as a tuple of any length
         cost=tr.as_cost(attrs.get("cost_usd")),
         timestamp=text_of(attrs.get("event.timestamp"), ""),
         loop=kind is not None,
@@ -170,6 +171,7 @@ def api_request_of(attrs: dict[str, Any]) -> Request:
         event=True,
         cache_5m=tr.as_number(attrs.get("cache_creation_5m_tokens")),
         cache_1h=tr.as_number(attrs.get("cache_creation_1h_tokens")),
+        speed=tr.as_str(attrs.get("speed")),
     )
 
 
@@ -177,25 +179,81 @@ def _native_step(record: dict[str, Any]) -> Request:
     usage = record.get("usage")
     usage = usage if isinstance(usage, dict) else {}
     tokens = tuple(tr.as_number(usage.get(key)) or 0.0 for key in NATIVE_TOKEN_KEYS)
+    agent = agent_of(record.get("agent"))  # as for a native compaction: absent, null, empty, falsy: the main loop
     return Request(
         session=text_of(record.get("session")),
         prompt=text_of(record.get("prompt")),
         model=text_of(record.get("model")),
         effort=tr.as_str(record.get("effort")),
-        tokens=tokens,  # type: ignore[arg-type]
+        tokens=tokens,  # type: ignore[arg-type]  # built from the four API_TOKEN_KEYS, which mypy sees as a tuple of any length
         cost=None,
         timestamp=text_of(record.get("ts"), ""),
         loop=True,
         stop=tr.as_str(record.get("stop")),
-        sub=record.get("agent") is not None,
-        agent=None if record.get("agent") is None else str(record.get("agent")),
-        subagent=clean_name(record.get("agent_type")) if record.get("agent") is not None else None,
+        sub=agent is not None,
+        agent=agent,
+        subagent=clean_name(record.get("agent_type")) if agent is not None else None,
     )
 
 
 def _id_text(value: object) -> str | None:
     """A request id as `agent_prompt_report._s` reads it: a non-empty str, else nothing."""
     return value if isinstance(value, str) and value else None
+
+
+def _keeps_session(project_filter: ProjectFilter | None, session: object) -> bool:
+    return project_filter is None or project_filter.keep({"session.id": session})
+
+
+def _load_spawn(record: dict[str, Any], project_filter: ProjectFilter | None, out: Capture) -> None:
+    session, agent = record.get("session"), record.get("spawned")
+    if not (isinstance(session, str) and isinstance(agent, str) and agent and _keeps_session(project_filter, session)):
+        return
+    # One agent id can be recorded twice: the first ticket and the first type win, so a later
+    # record with none cannot erase them.
+    first = out.spawns.get((session, agent))
+    ticket, agent_type = spawn_ticket(record.get("ticket")), spawn_type(record.get("subagent_type"))
+    if first is not None:
+        ticket, agent_type = first.ticket or ticket, first.agent_type or agent_type
+    out.spawns[(session, agent)] = Spawn(ticket, agent_type)
+
+
+def _load_plugin(record: dict[str, Any], project_filter: ProjectFilter | None, out: Capture) -> None:
+    session = record.get("session")
+    if isinstance(session, str) and names_you_should_know(record) and _keeps_session(project_filter, session):
+        out.you_should_know.add(text_of(session))
+
+
+def _load_native(record: dict[str, Any], project_filter: ProjectFilter | None, out: Capture) -> None:
+    """File one native `step`, `measure` or `compaction` record."""
+    if not _keeps_session(project_filter, record.get("session")):
+        return
+    kind = record.get("kind")
+    if kind == "step":
+        out.steps.append(_native_step(record))
+    elif kind == "compaction":
+        if record.get("skip") is None:
+            out.native_compactions.append(native_compaction_of(record))
+    elif (sample := sample_of(record)) is not None:
+        out.samples.append(sample)
+
+
+def _load_event(name: str, attrs: dict[str, Any], out: Capture, seen: set[tuple[str, str]]) -> None:
+    """File one `api_request` or `compaction` log event."""
+    if name != tr.API_REQUEST:
+        if str(attrs.get("success")).lower() != "false":
+            out.event_compactions.append(event_compaction_of(attrs))
+        return
+    request = api_request_of(attrs)
+    # The `--prompts` rule (agent_prompt_report._event): a costed request repeating a
+    # (session, request_id or client_request_id) is the mirrored copy of one request.
+    key = _id_text(attrs.get("request_id")) or _id_text(attrs.get("client_request_id"))
+    if key is not None and request.cost is not None:
+        if (request.session, key) in seen:
+            out.mirrored += 1
+            return
+        seen.add((request.session, key))
+    out.requests.append(request)
 
 
 def load_capture(capture: Path, project_filter: ProjectFilter | None = None) -> Capture:
@@ -207,66 +265,67 @@ def load_capture(capture: Path, project_filter: ProjectFilter | None = None) -> 
     for record in tr.capture_records(capture, skipped):
         kind = record.get("kind")
         if kind == "agent_spawn":
-            session, agent = record.get("session"), record.get("spawned")
-            if (
-                isinstance(session, str)
-                and isinstance(agent, str)
-                and agent
-                and (project_filter is None or project_filter.keep({"session.id": session}))
-            ):
-                # One agent id can be recorded twice: the first ticket and the first type win, so a later
-                # record with none cannot erase them.
-                first = out.spawns.get((session, agent))
-                ticket, agent_type = spawn_ticket(record.get("ticket")), spawn_type(record.get("subagent_type"))
-                if first is not None:
-                    ticket, agent_type = first.ticket or ticket, first.agent_type or agent_type
-                out.spawns[(session, agent)] = Spawn(ticket, agent_type)
-            continue
-        if kind in (PLUGIN_SET, PLUGIN_REGISTER):
-            session = record.get("session")
-            if (
-                isinstance(session, str)
-                and names_you_should_know(record)
-                and (project_filter is None or project_filter.keep({"session.id": session}))
-            ):
-                out.you_should_know.add(text_of(session))
-            continue
-        if kind in ("step", "measure", "compaction"):
-            if project_filter is not None and not project_filter.keep({"session.id": record.get("session")}):
-                continue
-            if kind == "step":
-                out.steps.append(_native_step(record))
-                continue
-            if kind == "compaction":
-                if record.get("skip") is None:
-                    out.native_compactions.append(native_compaction_of(record))
-            elif (sample := sample_of(record)) is not None:
-                out.samples.append(sample)
-            continue
-        for name, attrs in tr.iter_log_events(record.get("payload")):
-            if name not in (tr.API_REQUEST, COMPACTION):
-                continue
-            if project_filter is not None and not project_filter.keep(attrs):
-                continue
-            if name == tr.API_REQUEST:
-                request = api_request_of(attrs)
-                # The `--prompts` rule (agent_prompt_report._event): a costed request repeating a
-                # (session, request_id or client_request_id) is the mirrored copy of one request.
-                key = _id_text(attrs.get("request_id")) or _id_text(attrs.get("client_request_id"))
-                if key is not None and request.cost is not None:
-                    if (request.session, key) in seen:
-                        out.mirrored += 1
-                        continue
-                    seen.add((request.session, key))
-                out.requests.append(request)
-            elif str(attrs.get("success")).lower() != "false":
-                out.event_compactions.append(event_compaction_of(attrs))
+            _load_spawn(record, project_filter, out)
+        elif kind in (PLUGIN_SET, PLUGIN_REGISTER):
+            _load_plugin(record, project_filter, out)
+        elif kind in ("step", "measure", "compaction"):
+            _load_native(record, project_filter, out)
+        else:
+            for name, attrs in tr.iter_log_events(record.get("payload")):
+                if name not in (tr.API_REQUEST, COMPACTION):
+                    continue
+                if project_filter is not None and not project_filter.keep(attrs):
+                    continue
+                _load_event(name, attrs, out, seen)
     out.unreadable = skipped.lines
     return out
 
 
 def _match_key(request: Request) -> tuple[object, ...]:
     return (request.session, request.prompt, request.model, request.tokens)
+
+
+class _WindowCut:
+    """The `since`..`until` test of `filter_window`, with the count of requests it could not date."""
+
+    def __init__(self, since: datetime | None, until: datetime | None) -> None:
+        self.since = since
+        self.until = until
+        self.undated = 0
+
+    def keep(self, item: Request, *, count: bool = False) -> bool:
+        stamp = parse_timestamp(item.timestamp)
+        if stamp is None:
+            self.undated += count
+            return True
+        return (self.since is None or stamp >= self.since) and (self.until is None or stamp <= self.until)
+
+
+def _cut_steps(capture: Capture, cut: _WindowCut) -> tuple[list[Request], set[int], set[int]]:
+    """The native steps inside the window, the ids of the loop requests kept with their step, and the ids of
+    every loop request that has a step."""
+    event_prompts = {(r.session, r.prompt) for r in capture.requests if r.loop}
+    mirrored: dict[tuple[object, ...], deque[Request]] = defaultdict(deque)
+    for request in capture.requests:
+        if request.loop:
+            mirrored[_match_key(request)].append(request)
+    kept_pairs: set[int] = set()
+    paired: set[int] = set()
+    steps: list[Request] = []
+    for step in capture.steps:
+        if (step.session, step.prompt) not in event_prompts:
+            if cut.keep(step):
+                steps.append(step)
+            continue
+        candidates = mirrored.get(_match_key(step))
+        if not candidates:
+            continue  # the prompt has loop requests: the whole report never counts this step
+        request = candidates.popleft()
+        paired.add(id(request))
+        if cut.keep(step, count=True):
+            kept_pairs.add(id(request))
+            steps.append(step)
+    return steps, kept_pairs, paired
 
 
 def filter_window(capture: Capture, since: datetime | None, until: datetime | None) -> tuple[Capture, int]:
@@ -284,39 +343,10 @@ def filter_window(capture: Capture, since: datetime | None, until: datetime | No
     here too: the windows add up to the whole report."""
     if since is None and until is None:
         return capture, 0
-    undated = 0
-
-    def keep(item: Request, *, count: bool = False) -> bool:
-        nonlocal undated
-        stamp = parse_timestamp(item.timestamp)
-        if stamp is None:
-            undated += count
-            return True
-        return (since is None or stamp >= since) and (until is None or stamp <= until)
-
-    event_prompts = {(r.session, r.prompt) for r in capture.requests if r.loop}
-    mirrored: dict[tuple[object, ...], deque[Request]] = defaultdict(deque)
-    for request in capture.requests:
-        if request.loop:
-            mirrored[_match_key(request)].append(request)
-    kept_pairs: set[int] = set()
-    paired: set[int] = set()
-    steps: list[Request] = []
-    for step in capture.steps:
-        if (step.session, step.prompt) not in event_prompts:
-            if keep(step):
-                steps.append(step)
-            continue
-        candidates = mirrored.get(_match_key(step))
-        if not candidates:
-            continue  # the prompt has loop requests: the whole report never counts this step
-        request = candidates.popleft()
-        paired.add(id(request))
-        if keep(step, count=True):
-            kept_pairs.add(id(request))
-            steps.append(step)
-    requests = [r for r in capture.requests if (id(r) in kept_pairs if id(r) in paired else keep(r, count=True))]
-    return dataclasses.replace(capture, requests=requests, steps=steps), undated
+    cut = _WindowCut(since, until)
+    steps, kept_pairs, paired = _cut_steps(capture, cut)
+    requests = [r for r in capture.requests if (id(r) in kept_pairs if id(r) in paired else cut.keep(r, count=True))]
+    return dataclasses.replace(capture, requests=requests, steps=steps), cut.undated
 
 
 # --- sessions --------------------------------------------------------------------
@@ -402,6 +432,40 @@ class Session:
     def hints(self) -> dict[str, str]:
         return dh.hint_lines(self.hint_input())
 
+    def _add_loop(self, request: Request) -> None:
+        self.iterations += 1
+        self.sub_iterations += request.sub
+        if request.sub:
+            self.sub_cost += request.cost or 0.0
+        self.models[request.model] += 1
+        if request.effort:
+            self.efforts[request.effort] += 1
+
+    def _add_side(self, request: Request, seconds: float | None) -> None:
+        self.side_requests += 1
+        self.side_cost += request.cost or 0.0
+        if request.source == COMPACT_SOURCE and seconds is not None:
+            self.main_compaction_stamps.append(seconds)
+        if request.source == HOOK_PROMPT:
+            self.hook_requests += 1
+            self.hook_cost += request.cost or 0.0
+
+    def _add_cache_row(self, request: Request, seconds: float) -> None:
+        if request.sub and not request.agent_id:
+            self.keyless_rows += 1  # not attributable to one subagent: no loop to compare within
+            return
+        _, _, read, created = request.tokens
+        self.cache_rows.append(
+            dh.CacheRow(
+                seconds,
+                (request.agent_id or "") if request.sub else dh.MAIN_LOOP,
+                read,
+                created,
+                request.cache_5m,
+                request.cache_1h,
+            )
+        )
+
     def add(self, request: Request) -> None:
         self.requests += 1
         stamp = parse_timestamp(request.timestamp)
@@ -416,37 +480,13 @@ class Session:
         else:
             self.cost += request.cost
         if request.loop:
-            self.iterations += 1
-            self.sub_iterations += request.sub
-            if request.sub:
-                self.sub_cost += request.cost or 0.0
-            self.models[request.model] += 1
-            if request.effort:
-                self.efforts[request.effort] += 1
+            self._add_loop(request)
         else:
-            self.side_requests += 1
-            self.side_cost += request.cost or 0.0
-            if request.source == COMPACT_SOURCE and seconds is not None:
-                self.main_compaction_stamps.append(seconds)
-            if request.source == HOOK_PROMPT:
-                self.hook_requests += 1
-                self.hook_cost += request.cost or 0.0
+            self._add_side(request, seconds)
         if seconds is not None:
             self.stamps.append(seconds)
             if request.loop and request.event:
-                if request.sub and not request.agent_id:
-                    self.keyless_rows += 1  # not attributable to one subagent: no loop to compare within
-                else:
-                    self.cache_rows.append(
-                        dh.CacheRow(
-                            seconds,
-                            (request.agent_id or "") if request.sub else dh.MAIN_LOOP,
-                            read,
-                            created,
-                            request.cache_5m,
-                            request.cache_1h,
-                        )
-                    )
+                self._add_cache_row(request, seconds)
         if request.timestamp:
             self.first = min(self.first or request.timestamp, request.timestamp)
             self.last = max(self.last, request.timestamp)
@@ -489,6 +529,7 @@ def _miss_inputs(capture: Capture) -> tuple[dict[str, list[cm.Req]], dict[str, l
                 None if r.cache_1h is None else int(r.cache_1h),
                 r.cost or 0.0,
                 r.request_id or "",
+                r.speed,
             )
         )
     for st in capture.steps:
@@ -556,11 +597,11 @@ def build_report(capture: Capture) -> SessionReport:
 # --- formatting --------------------------------------------------------------------
 
 
-def _percent(value: float | None, digits: int = 0) -> str:
+def format_percent(value: float | None, digits: int = 0) -> str:
     return NONE if value is None else f"{value:.{digits}f}%"
 
 
-def _cost(session: Session) -> str:
+def format_cost(session: Session) -> str:
     return f"${session.cost:.2f}" if session.requests > session.uncosted else NONE
 
 
@@ -589,13 +630,13 @@ def _row(session: Session) -> list[str]:
         f"{session.requests:,}",
         f"{session.iterations:,}",
         f"{session.sub_iterations:,}",
-        _cost(session),
+        format_cost(session),
         as_int(session.tokens),
-        _percent(session.cache_percent, 1),
-        _percent(session.side_request_share),
-        _percent(session.side_cost_share),
-        _percent(session.hook_cost_share, 1),
-        _percent(session.peak_context),
+        format_percent(session.cache_percent, 1),
+        format_percent(session.side_request_share),
+        format_percent(session.side_cost_share),
+        format_percent(session.hook_cost_share, 1),
+        format_percent(session.peak_context),
         f"{session.compactions:,}",
         _short(session.models),
         _short(session.efforts),
@@ -639,7 +680,7 @@ def _hook_block(sessions: list[Session]) -> list[str]:
         return []
     total = sum(s.cost for s in sessions)
     rows = [
-        [label, f"{n:,.0f}", f"${cost:.2f}", _percent(_share(cost, total), 1)]
+        [label, f"{n:,.0f}", f"${cost:.2f}", format_percent(_share(cost, total), 1)]
         for label, (n, cost) in sorted(by_label.items(), key=lambda item: (-item[1][0], item[0]))
     ]
     return [

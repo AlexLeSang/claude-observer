@@ -1,6 +1,6 @@
 ---
 name: usage-reflection
-description: Answers questions about the user's own Claude usage from this project's captured telemetry - where spend or quota went, why a session was expensive, context fill and compaction, plugin, skill or hook overhead.
+description: Answers questions about the user's own Claude usage from this project's captured telemetry - where spend or quota went, why a session was expensive, context fill and compaction, plugin, skill or hook overhead; what the plugin's cache line or a subagent alert means.
 ---
 
 # Usage reflection
@@ -27,9 +27,13 @@ Read only the one reference file that matches the question, by its absolute path
 
 For "how much of my five-hour or weekly quota is used, and is that ahead of the clock": run `python3 -B ${CLAUDE_PLUGIN_ROOT}/scripts/quota_report.py --pace` (same `<python>` rule; it reads no transcript and no capture). It prints used % next to elapsed % for each window from this machine's latest reading, with the reading's age. To see only the reading and its age, run `python3 -B ${CLAUDE_PLUGIN_ROOT}/scripts/quota_latest.py`. Say `stale` when the age is over 360 s, say a `reset` window has no current figure, and say `unknown` when no reading exists. Used above elapsed means the window is being spent faster than it runs; that is a reading, not a prediction. For the five-hour window it also prints one linear line ("at this pace you reach N% at reset / 100% at HH:MM UTC") with its backtest beside it: quote it only with that label and the backtest result (no method beat assuming no growth, and this pace overshot), say it is arithmetic and not a forecast, and say so when it prints "no line". Give no hours left of your own and never extrapolate further.
 
+## The cache line and subagent alerts
+
+For "what is the cache line under my prompt, how long is my cache warm, what does a cold return cost" and for "why did a subagent alert fire": run no view; these are live on the user's screen, not in a report. Explain from the line or alert text the user pastes, and only from it. `cache main 1h, 59m left, cold $1.00` is the lifetime in force, the time left and the estimated dollar price of a cold return; `URGENT` starts 1 minute before a 5-minute cache expires and 10 minutes before a 1-hour cache expires; `EXPIRED` keeps the price; `5m?` and `lifetime unknown: 5m assumed` mean the lifetime could not be read and 5 minutes is assumed. It is an estimate, not a bill, and it says nothing about whether returning is worth it. A subagent alert says one subagent passed its size limit (tokens) or its time limit (active hours); say whether the text calls the limit the default or the user's own, and that each alert fires at most once per subagent (a restart before the tally is saved can repeat it) and stops nothing. To change the limits, hand over to the `calibrate-alerts` skill. To turn the line or the alerts off, the plugin options are `cacheLine` and `subagentAlerts`. Never advise stopping a subagent or sending a keepalive.
+
 ## When the runner stops
 
-- Exit 3 with a message naming the capture path: the plugin's `capture` option may be customised. Ask the user for their capture path and pass `--capture PATH`, only a path the user gave you in this conversation, never one found in another project or by searching.
+- Exit 3 with a message saying no plugin capture was found, or that the file is not a plugin capture (the message names no path): the plugin's `capture` option may be customised. Ask the user for their capture path and pass `--capture PATH`, only a path the user gave you in this conversation, never one found in another project or by searching.
 - Exit 3 because the project label matched none of the sessions, or there is no kanban board: say so and stop; do not try other files.
 - Exit 2: the view is not one of the list above, or the report rejected an argument or the project label (the message on stderr says which).
 - Any other code (for example 1 after a crash or timeout), or exit 3 saying Python is too old: quote stderr and stop.

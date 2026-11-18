@@ -52,13 +52,13 @@ MIN_CLAUDE_CODE = "2.1.287"
 # plugin/hooks/python.ts: `PYTHON_CANDIDATES` and `MIN_PYTHON`, pinned equal by a test.
 PYTHON_CANDIDATES: tuple[tuple[str, ...], ...] = (("python3",), ("python",), ("py", "-3"))
 MIN_PYTHON = (3, 10)
-LEVELS = ("ok", "warn", "fail", "unknown", "info")
 PROBE_SECONDS = 3.0
 PROBE_KEEP = 4096
 TAIL_BYTES = 256 * 1024
 MAX_LINE = 64 * 1024
 SMALL_FILE = 1024 * 1024
 CONTENT_SECONDS = 60
+ALERT_CALIBRATION_SECONDS = 60  # the time budget of the alert calibration check's read of the whole capture
 GIT_SECONDS = 8.0
 SHOWN_CAP = 120
 EXCERPT_DEFAULT_LINES = 10
@@ -73,10 +73,10 @@ OSRELEASE = Path("/proc/sys/kernel/osrelease")
 # The surfaces the plugin records (observer.ts: terminal, desktop, vscode, mobile or null); any other value is "other".
 SURFACES = frozenset({"terminal", "desktop", "vscode", "mobile"})
 
-# One version grammar with the excerpt's projection (excerpt_project._VERSION, 1-4 digits a part): a number the capture's
+# One version grammar with the excerpt's projection (excerpt_project.VERSION, 1-4 digits a part): a number the capture's
 # writer controls is shown only when the excerpt would keep it too.
 _VERSION_OUT = re.compile(r"\A\s{0,8}([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})(?![0-9.])", re.ASCII)
-_VERSION_FIELD = ep._VERSION  # noqa: SLF001  (the one grammar, not a copy)
+_VERSION_FIELD = ep.VERSION  # the one grammar, not a copy
 _PYTHON_OUT = re.compile(r"\A\s{0,8}Python ([0-9]{1,3})\.([0-9]{1,3})(?![0-9])")
 
 
@@ -110,9 +110,9 @@ def shown_path(path: Path | str, home: Path | str) -> str:
         try:
             relative = Path(resolve(path)).relative_to(resolve(home))
         except ValueError:
-            continue
+            continue  # not under this home with this resolver: try the other, then fall back
         return "<project>/" + _clean(relative.as_posix())
-    return "<outside project>/" + _clean(Path(os.path.abspath(path)).name)  # noqa: PTH100
+    return "<outside project>/" + _clean(Path(os.path.abspath(path)).name)  # noqa: PTH100 - abspath, unlike resolve, does not follow a link
 
 
 def _probe(argv: list[str], timeout: float) -> tuple[int, str] | None:
@@ -184,7 +184,7 @@ def _last_session_start(capture: Path | None) -> dict[str, object] | None:
         try:
             record = json.loads(line.decode("utf-8", "replace"))
         except (ValueError, RecursionError):
-            continue
+            continue  # torn, odd or bad line: skipped without a count
         if isinstance(record, dict) and record.get("kind") == "session_start":
             return record
     return None
@@ -417,49 +417,60 @@ def _read_small(path: Path) -> bytes | None:
         os.close(fd)
 
 
+def _locate(capture: Path, deadline: float) -> tuple[Path, bytes] | Result:
+    """The work tree top and the capture's path in it (relative, `/`-separated bytes), or the `git-ignore`
+    result that says why there is no ignore check."""
+    try:
+        anchor = _nearest_dir(capture.parent)
+    except OSError:
+        return Result("git-ignore", "unknown", "cannot look at the capture's directory")
+    if anchor is None:
+        return Result("git-ignore", "unknown", "no existing directory above the capture path")
+    missing_parts = capture.parent.relative_to(anchor[0]).parts if capture.parent.is_relative_to(anchor[0]) else ()
+    full = anchor[0].resolve().joinpath(*missing_parts, capture.name)
+    ran = ce.git(anchor[0].resolve(), ["rev-parse", "--show-toplevel"], deadline)
+    if ran is None:
+        return Result("git-ignore", "unknown", "git did not answer (missing, too slow or out of time)")
+    top_out = ran.stdout.removesuffix(b"\n")
+    if ran.returncode != 0 or not top_out:
+        return Result("git-ignore", "info", "the capture is not in a git work tree: no ignore check")
+    top = Path(os.fsdecode(top_out)).resolve()
+    try:
+        return top, os.fsencode(full.relative_to(top).as_posix())
+    except ValueError:
+        return Result("git-ignore", "info", "the capture is outside the git work tree: no ignore check")
+
+
+def _ignore_line(top: Path, rel: bytes, unignored: list[bytes], shown: str, deadline: float) -> Result:
+    if ce.tracked_warning(top, rel, deadline, "capture") is not None:
+        return Result("git-ignore", "fail", f"{shown} is tracked by git: run `git rm --cached` on it")
+    if not unignored:
+        return Result("git-ignore", "ok", "the capture, its rotated files and its sidecars are ignored by git")
+    if rel in unignored:
+        return Result("git-ignore", "warn", f"{shown} is not ignored by git: `git add -A` would commit it")
+    return Result("git-ignore", "warn", "a rotated file or sidecar name of the capture is not ignored by git")
+
+
 def check_git(capture: Path, budget: float = GIT_SECONDS, home: Path | None = None) -> list[Result]:
     """Is the capture, a rotated file and each sidecar ignored, is it tracked, is the plugin's `info/exclude` line
     there. Read-only: `git check-ignore`, `git ls-files`, `git rev-parse`, through `capture_exclude`."""
     deadline = time.monotonic() + budget
     shown = shown_path(capture, project_home(Path.cwd()) if home is None else home)
-    try:
-        anchor = _nearest_dir(capture.parent)
-    except OSError:
-        return [Result("git-ignore", "unknown", "cannot look at the capture's directory")]
-    if anchor is None:
-        return [Result("git-ignore", "unknown", "no existing directory above the capture path")]
-    missing_parts = capture.parent.relative_to(anchor[0]).parts if capture.parent.is_relative_to(anchor[0]) else ()
-    full = anchor[0].resolve().joinpath(*missing_parts, capture.name)
-    ran = ce.git(anchor[0].resolve(), ["rev-parse", "--show-toplevel"], deadline)
-    if ran is None:
-        return [Result("git-ignore", "unknown", "git did not answer (missing, too slow or out of time)")]
-    top_out = ran.stdout.removesuffix(b"\n")
-    if ran.returncode != 0 or not top_out:
-        return [Result("git-ignore", "info", "the capture is not in a git work tree: no ignore check")]
-    top = Path(os.fsdecode(top_out)).resolve()
-    try:
-        rel = os.fsencode(full.relative_to(top).as_posix())
-    except ValueError:
-        return [Result("git-ignore", "info", "the capture is outside the git work tree: no ignore check")]
+    located = _locate(capture, deadline)
+    if isinstance(located, Result):
+        return [located]
+    top, rel = located
     unignored = ce.unignored(top, [rel + suffix for suffix in ce.PROBE_SUFFIXES], deadline)
     if unignored is None:
         return [Result("git-ignore", "unknown", "git check-ignore did not answer")]
-    if ce.tracked_warning(top, rel, deadline, "capture") is not None:
-        first = Result("git-ignore", "fail", f"{shown} is tracked by git: run `git rm --cached` on it")
-    elif not unignored:
-        first = Result("git-ignore", "ok", "the capture, its rotated files and its sidecars are ignored by git")
-    elif rel in unignored:
-        first = Result("git-ignore", "warn", f"{shown} is not ignored by git: `git add -A` would commit it")
-    else:
-        first = Result("git-ignore", "warn", "a rotated file or sidecar name of the capture is not ignored by git")
-    return [first, _exclude_line(top, rel, rel not in unignored, deadline)]
+    return [_ignore_line(top, rel, unignored, shown, deadline), _exclude_line(top, rel, rel not in unignored, deadline)]
 
 
 def _exclude_line(top: Path, rel: bytes, ignored: bool, deadline: float) -> Result:
     where = ce.git(top, ["rev-parse", "--git-path", "info/exclude"], deadline)
     body = None
     if where is not None and where.returncode == 0 and where.stdout.strip():
-        exclude = Path(os.path.abspath(top / os.fsdecode(where.stdout.removesuffix(b"\n"))))  # noqa: PTH100
+        exclude = Path(os.path.abspath(top / os.fsdecode(where.stdout.removesuffix(b"\n"))))  # noqa: PTH100 - abspath, unlike resolve, does not follow a link
         body = _read_small(exclude)
     lines = {line.removesuffix(b"\r") for line in (body or b"").split(b"\n")}
     wanted = ce.patterns(rel)
@@ -507,6 +518,24 @@ def check_session(capture: Path | None) -> Result:
     return Result("session", "info", "; ".join(parts))
 
 
+def _content_figures(printed: str) -> tuple[dict[str, int], int] | None:
+    """The totals and the file count in the content check's JSON, or None when it printed no counts."""
+    try:
+        body = json.loads(printed)
+        totals = body["totals"]
+        figures = {name: totals[name] for name in ("lines", "removable", "serialized", "unparseable", "identity")}
+        files = len(body["files"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not all(type(v) is int for v in figures.values()):
+        return None
+    return figures, files
+
+
+# The content check's exit code -> level and lead; any other code is an incomplete scan.
+_CONTENT_CODES = {0: ("ok", "none found"), 1: ("fail", "content or identity attributes are on disk")}
+
+
 def check_content(capture: Path) -> Result:
     """`check_capture_content` over the capture and its rotated files; counts only."""
     out, err = io.StringIO(), io.StringIO()
@@ -519,25 +548,48 @@ def check_content(capture: Path) -> Result:
         return Result("content", "unknown", f"the content check did not run ({type(error).__name__})")
     if code == 2:
         return Result("content", "unknown", "no capture file to check")
-    try:
-        body = json.loads(out.getvalue())
-        totals = body["totals"]
-        figures = {name: totals[name] for name in ("lines", "removable", "serialized", "unparseable", "identity")}
-        files = len(body["files"])
-    except (ValueError, KeyError, TypeError):
+    parsed = _content_figures(out.getvalue())
+    if parsed is None:
         return Result("content", "unknown", "the content check printed no counts")
-    if not all(type(v) is int for v in figures.values()):
-        return Result("content", "unknown", "the content check printed no counts")
+    figures, files = parsed
     counts = (
         f"{figures['lines']} lines in {files} files; content in {figures['removable']} removable, "
         f"{figures['serialized']} serialized and {figures['unparseable']} unparseable lines; "
         f"identity in {figures['identity']} lines"
     )
-    if code == 0:
-        return Result("content", "ok", f"none found: {counts}")
-    if code == 1:
-        return Result("content", "fail", f"content or identity attributes are on disk: {counts}")
-    return Result("content", "unknown", f"the scan was incomplete: {counts}")
+    level, lead = _CONTENT_CODES.get(code, ("unknown", "the scan was incomplete"))
+    return Result("content", level, f"{lead}: {counts}")
+
+
+def check_alert_calibration(capture: Path, now: float | None = None) -> Result:
+    """Whether the subagent alerts still use defaults or an old calibration: `info` when the calibration script's
+    hint applies, else `ok`. The script is imported here, not at the top, so a fault in it is one `unknown` line."""
+    import agent_alert_calibration as aac  # noqa: PLC0415  (a late import: see the docstring)
+
+    moment = time.time() if now is None else now
+    history = aac.load_history(capture, moment, time.monotonic() + ALERT_CALIBRATION_SECONDS)
+    if history.timed_out:
+        return Result(
+            "alert-calibration",
+            "unknown",
+            f"the capture was too big to read in the {ALERT_CALIBRATION_SECONDS:g} s time budget",
+        )
+    count = len(history.agents)
+    if aac.calibration_tracked(capture):
+        # The mod ignores a calibration file git tracks (a cloned repository could set the limits), so say why.
+        return Result("alert-calibration", "warn", f"{count} past subagents; {aac.TRACKED_HINT}")
+    cal = aac.read_calibration(capture)
+    hint = aac.calibration_hint(count, cal, moment)
+    if hint is not None:
+        return Result("alert-calibration", "info", f"{count} past subagents; {hint}")
+    if cal is None:
+        return Result("alert-calibration", "ok", f"{count} past subagents; no calibration, none needed yet")
+    days = aac.age_days(cal, moment)  # the one age rule, not a copy
+    return Result(
+        "alert-calibration",
+        "ok",
+        f"{count} past subagents; calibration {days} days old, made on {cal.agents} subagents",
+    )
 
 
 # ---- running ---------------------------------------------------------------------------------------------------
@@ -562,6 +614,7 @@ def run_checks(
     results += _guard("git-ignore", lambda: check_git(capture, home=home))
     results += _guard("session", lambda: check_session(capture))
     results += _guard("content", lambda: check_content(capture))
+    results += _guard("alert-calibration", lambda: check_alert_calibration(capture))
     return results
 
 
@@ -580,14 +633,14 @@ def render_json(results: list[Result], shown: str, code: int, excerpt: str | Non
     return json.dumps(body, indent=2)
 
 
-def _display_path(path: Path, *, private_dir: bool = False) -> str:
+def display_path(path: Path, *, private_dir: bool = False) -> str:
     """A path the user must open: `~/...` under their home directory; anywhere else only the file name and a one-line
     hint, because an absolute path outside the home directory can name directories. `private_dir` adds the name of the
     parent, the doctor's own random directory (no private data in it), so the file can be found under the temp
     directory. Made printable and capped."""
-    full = os.path.abspath(path)  # noqa: PTH100
+    full = os.path.abspath(path)  # noqa: PTH100 - abspath, unlike resolve, does not follow a link
     try:
-        relative = Path(full).relative_to(os.path.expanduser("~"))  # noqa: PTH111
+        relative = Path(full).relative_to(os.path.expanduser("~"))  # noqa: PTH111 - the string form, to compare with the abspath string above
     except ValueError:
         name = Path(full).name
         if private_dir:
@@ -632,7 +685,7 @@ def excerpt_result(
         Result(
             "excerpt",
             "info",
-            f"{_display_path(built.path, private_dir=args.out is None)} written, mode 0600; read it before you paste it ({built.note})",
+            f"{display_path(built.path, private_dir=args.out is None)} written, mode 0600; read it before you paste it ({built.note})",
         )
     ]
     if built.kept_dir is not None:  # its own line: a long path above must not cut the warning off (TEXT_CAP)
@@ -640,7 +693,7 @@ def excerpt_result(
             Result(
                 "excerpt-keep",
                 "info",
-                f"never paste or share {_display_path(built.kept_dir)}: it holds the scrubbed, unprojected copy of the "
+                f"never paste or share {display_path(built.kept_dir)}: it holds the scrubbed, unprojected copy of the "
                 "capture's tail; the scrub is not a guarantee, so it can still hold names and other text",
             )
         )

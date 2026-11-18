@@ -4,8 +4,9 @@ Prices are USD per MTok (input, cache read) by model id prefix. Source: the clau
 skill's model table (cached 2026-09-25), corrected and extended against the official
 pricing page https://platform.claude.com/docs/en/about-claude/pricing.md, retrieved
 2026-10-15 (the operator chose
-the page's figures, 2026-10-15). Cache reads are $0.25 on Fable 5.1 and Mythos 5.1,
-$1.00 on Fable 5 and Mythos 5, $0.20 on Opus 5.5 and Sonnet 5, $0.10 on Sonnet 5.5
+the page's figures, 2026-10-15); the Fable 5.2 and Mythos 5.2 rows from the same page, retrieved
+2026-11-09. Cache reads are $0.20 on Fable 5.2 and Mythos 5.2 and $0.25 on Fable 5.1 and
+Mythos 5.1 (0.025x input), $1.00 on Fable 5 and Mythos 5, $0.20 on Opus 5.5 and Sonnet 5, $0.10 on Sonnet 5.5
 (0.05x input; it was $0.20 here before), and 0.1x input elsewhere
 (Mythos is priced as Fable, Opus 4.6 as Opus 4.7). An id
 matches a row only when it is the row's id, optionally with a `-YYYYMMDD` snapshot
@@ -42,14 +43,18 @@ Price ratios live here too, once each: a cache write costs
 row's own price (`cache_read_equivalent` expresses it against the baseline input).
 
 `agent_skill_report` (load overhead) and `agent_reasoning_report` read the
-prices; `agent_usage_report` derives its model weights from the prices.
+prices; `agent_usage_report` derives its model weights from the prices. The usage and
+reasoning reports apply `speed_factor`, the cache-miss report applies `speed_multiplier` to the
+`speed` of the `api_request` that missed; the skill-overhead report prices at the standard rate
+(its `step` record documents no `speed`).
 
 Fast mode: a message whose `usage.speed` is exactly `"fast"` on a model in
 `FAST_MODE_MODELS` costs `FAST_MODE_FACTOR` x the standard price for every token kind
-(claude-api skill, model-migration and platform-availability references: Opus 5.5 $8 / $40,
-Opus 5 and Opus 4.8 $10 / $50 per MTok, 2x each; research preview on the first-party API
-only). Whether the multiplier also covers cache reads and writes is not stated there; it
-is applied to all kinds, so a fast message is priced at 2x, never less. A `fast` speed on
+(pricing and fast-mode pages: Fable 5.2 and Mythos 5.2 $16 / $80, Opus 5.5 $8 / $40,
+Opus 5 and Opus 4.8 $10 / $50 per MTok, 2x each; Opus 5 and 4.8 are a research preview on
+the first-party API only). The fast-mode page says "Prompt caching multipliers apply on top of fast mode pricing"
+(retrieved 2026-11-10) but lists no per-kind fast cache figure, so the 2x is applied to every kind, cache reads and
+writes included: a fast message is priced at 2x, never less. A `fast` speed on
 a model outside the set is priced as standard. Web search is $10 per 1,000 requests
 (`WEB_SEARCH_USD` each, claude-api skill, managed-agents-core), model- and speed-independent;
 web fetch has no charge of its own.
@@ -83,8 +88,10 @@ class PriceRow(NamedTuple):
 
 
 MODEL_PRICES: Final[tuple[PriceRow, ...]] = (
+    PriceRow("claude-fable-5-2", 8.00, 0.20),
     PriceRow("claude-fable-5-1", 10.00, 0.25),
     PriceRow("claude-fable-5", 10.00, 1.00),
+    PriceRow("claude-mythos-5-2", 8.00, 0.20),
     PriceRow("claude-mythos-5-1", 10.00, 0.25),
     PriceRow("claude-mythos-5", 10.00, 1.00),
     PriceRow("claude-opus-5-5", 4.00, 0.20),
@@ -106,7 +113,9 @@ MODEL_PRICES: Final[tuple[PriceRow, ...]] = (
 )
 
 # Models with fast mode (`speed: "fast"`), by table id; matched like any other id.
-FAST_MODE_MODELS: Final[frozenset[str]] = frozenset({"claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"})
+FAST_MODE_MODELS: Final[frozenset[str]] = frozenset(
+    {"claude-fable-5-2", "claude-mythos-5-2", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8"}
+)
 FAST_MODE_FACTOR: Final[float] = 2.0  # fast-mode price, x the standard price of every token kind
 WEB_SEARCH_USD: Final[float] = 0.01  # one web search request ($10 per 1,000)
 # Most web search requests one message may carry; more is a corrupt record. A request
@@ -165,11 +174,17 @@ def supports_fast_mode(model: str | None) -> bool:
     return row is not None and row.model in FAST_MODE_MODELS
 
 
-def speed_factor(usage: Mapping[str, object], model: str | None) -> float:
-    """`FAST_MODE_FACTOR` for a fast-mode message on a model that has it, else 1.0."""
-    if usage.get("speed") == "fast" and supports_fast_mode(model):
+def speed_multiplier(speed: object, model: str | None) -> float:
+    """`FAST_MODE_FACTOR` when `speed` is exactly the string `"fast"` and `model` has fast mode, else 1.0.
+    The one place that compares a speed; a record's reader passes its `speed` here and multiplies once."""
+    if speed == "fast" and supports_fast_mode(model):
         return FAST_MODE_FACTOR
     return 1.0
+
+
+def speed_factor(usage: Mapping[str, object], model: str | None) -> float:
+    """`speed_multiplier` of a message's `usage.speed`."""
+    return speed_multiplier(usage.get("speed"), model)
 
 
 def web_search_equivalent(usage: Mapping[str, object]) -> float:

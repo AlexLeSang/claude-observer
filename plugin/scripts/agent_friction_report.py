@@ -38,7 +38,7 @@ import agent_tool_report as tr
 import transcript_iterator as ti
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     from agent_telemetry import ProjectFilter
 
@@ -160,6 +160,38 @@ def is_object(line: str) -> bool:
         return False
 
 
+def _parse_record(line: str, seen: set[bytes], data: Friction) -> dict[str, Any] | None:
+    """The JSON object of a candidate line, or none when it repeats an earlier line or is not an object (counted)."""
+    digest = hashlib.blake2b(line.encode("utf-8", "replace"), digest_size=16).digest()
+    if digest in seen:
+        data.duplicate_lines += 1
+        return None
+    seen.add(digest)
+    try:
+        record = json.loads(line)
+    except (ValueError, RecursionError):
+        record = None
+    if not isinstance(record, dict):
+        data.skipped_lines += 1
+        return None
+    return record
+
+
+def _count_event(data: Friction, name: str, attrs: dict[str, Any]) -> None:
+    """Add one hook execution or failed tool result to `data`; an event without a session id is counted apart."""
+    session = attrs.get("session.id")
+    if not isinstance(session, str) or not session:
+        data.no_session += 1
+        return
+    data.sessions.add(session)
+    if name == HOOK_COMPLETE:
+        add_hook(data, session, attrs)
+    elif is_false(attrs.get("success")):
+        sig = data.signatures[(name_of(attrs.get("tool_name")), name_of(attrs.get("error_type")))]
+        sig.sessions.add(session)
+        sig.failures += 1
+
+
 def load(capture: Path, project_filter: ProjectFilter | None = None) -> Friction:
     """Count the capture's hook executions and failed tool results (rotated files included)."""
     data = Friction()
@@ -170,34 +202,12 @@ def load(capture: Path, project_filter: ProjectFilter | None = None) -> Friction
             if line.strip() and not is_object(line):  # a torn line cut before the marker is still a lost line
                 data.skipped_lines += 1
             continue
-        digest = hashlib.blake2b(line.encode("utf-8", "replace"), digest_size=16).digest()
-        if digest in seen:
-            data.duplicate_lines += 1
-            continue
-        seen.add(digest)
-        try:
-            record = json.loads(line)
-        except (ValueError, RecursionError):
-            record = None
-        if not isinstance(record, dict):
-            data.skipped_lines += 1
+        record = _parse_record(line, seen, data)
+        if record is None:
             continue
         for name, attrs in tr.iter_log_events(record.get("payload")):
-            if name not in (HOOK_COMPLETE, TOOL_RESULT):
-                continue
-            if project_filter is not None and not project_filter.keep(attrs):
-                continue
-            session = attrs.get("session.id")
-            if not isinstance(session, str) or not session:
-                data.no_session += 1
-                continue
-            data.sessions.add(session)
-            if name == HOOK_COMPLETE:
-                add_hook(data, session, attrs)
-            elif is_false(attrs.get("success")):
-                sig = data.signatures[(name_of(attrs.get("tool_name")), name_of(attrs.get("error_type")))]
-                sig.sessions.add(session)
-                sig.failures += 1
+            if name in (HOOK_COMPLETE, TOOL_RESULT) and (project_filter is None or project_filter.keep(attrs)):
+                _count_event(data, name, attrs)
     return data
 
 
@@ -231,44 +241,56 @@ def exit_kind(value: object) -> str:
     return EXIT_KINDS.get(int(number), EXIT_OTHER)
 
 
-def attachments(path: Path, data: Transcripts) -> list[dict[str, Any]]:
+def _json_object(line: str) -> dict[str, Any] | None:
+    """The line's JSON object, or none (a ValueError is an integer past the digit limit)."""
+    try:
+        record = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
+def _scan_lines(handle: Iterable[str]) -> tuple[list[dict[str, Any]], int, str, str]:
+    """(attachments, unreadable candidate lines, a trailing torn line, the last unparsed non-blank line) of a file."""
+    found: list[dict[str, Any]] = []
+    unreadable = 0
+    last = ""  # the last non-blank line that the prefilter did not parse
+    torn = ""  # a line that failed to parse without the marker as plain text: a torn end if nothing follows it
+    for line in handle:
+        if line.strip() and torn:  # something follows it, so it was not the end of the file
+            unreadable += 1
+            torn = ""
+        # A JSON escape may spell the type (`\\u0068ook_...`): such a line is parsed, not skipped.
+        if ATTACHMENT not in line and "\\u" not in line:
+            last = line if line.strip() else last
+            continue
+        last = ""
+        record = _json_object(line)
+        if record is None:
+            if ATTACHMENT in line:
+                unreadable += 1
+            else:
+                torn = line
+            continue
+        attachment = record.get("attachment")
+        if isinstance(attachment, dict) and attachment.get("type") == ATTACHMENT:
+            found.append(attachment)
+    return found, unreadable, torn, last
+
+
+def attachments(path: Path, data: Transcripts, root: Path | None = None) -> list[dict[str, Any]]:
     """The `hook_non_blocking_error` attachments of one transcript file, or none when the file cannot be opened or
     read to the end (counted in `data.unreadable_files`; nothing of a partly read file is kept, its lines are not
     counted either). A candidate line that is not a JSON object is counted in `data.unreadable_lines`, never kept
     silently. The file's last non-blank line, when it is not a JSON object and does not carry the marker as plain
     text (cut off before it: a torn write, perhaps inside an escape), is counted in `data.torn_ends` instead."""
-    found: list[dict[str, Any]] = []
-    unreadable = 0
-    last = ""  # the last non-blank line that the prefilter did not parse
-    torn = ""  # a line that failed to parse without the marker as plain text: a torn end if nothing follows it
-    fd = ti._open_regular(path)  # noqa: SLF001  # never blocks on a FIFO, refuses a symlink and a non-regular file
+    fd = ti.open_regular(path, root)  # never blocks on a FIFO; refuses a symlink, a link below `root`
     if fd is None:
         data.unreadable_files += 1
         return []
     try:
         with open(fd, encoding="utf-8", errors="replace") as handle:  # noqa: PTH123  # closes the fd
-            for line in handle:
-                if line.strip() and torn:  # something follows it, so it was not the end of the file
-                    unreadable += 1
-                    torn = ""
-                # A JSON escape may spell the type (`\\u0068ook_...`): such a line is parsed, not skipped.
-                if ATTACHMENT not in line and "\\u" not in line:
-                    last = line if line.strip() else last
-                    continue
-                last = ""
-                try:
-                    record = json.loads(line)
-                except (ValueError, RecursionError):  # ValueError: an integer past the digit limit
-                    record = None
-                if not isinstance(record, dict):
-                    if ATTACHMENT in line:
-                        unreadable += 1
-                    else:
-                        torn = line
-                    continue
-                attachment = record.get("attachment")
-                if isinstance(attachment, dict) and attachment.get("type") == ATTACHMENT:
-                    found.append(attachment)
+            found, unreadable, torn, last = _scan_lines(handle)
     except OSError:
         data.unreadable_files += 1
         return []
@@ -297,7 +319,7 @@ def read_transcripts(dirs: Sequence[Path], local: pr.LocalPlugins) -> Transcript
     for directory in dirs:
         for context in ti.discover_transcripts(directory):
             failed_before = data.unreadable_files
-            for attachment in attachments(context.transcript_path, data):
+            for attachment in attachments(context.transcript_path, data, context.root):
                 kind, plugin = owner_of(declared, attachment)
                 source = data.sources[(kind, plugin, exit_kind(attachment.get("exitCode")))]
                 source.runs += 1

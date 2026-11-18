@@ -37,6 +37,7 @@ from agent_context_fill import (
     COMPACTION,
     Compaction,
     Sample,
+    agent_of,
     count_compactions,
     event_compaction_of,
     native_compaction_of,
@@ -98,7 +99,7 @@ def _event_follower(attrs: dict[str, Any]) -> Follower | None:
 
 
 def _native_follower(record: dict[str, Any]) -> Follower | None:
-    if record.get("agent") is not None:
+    if agent_of(record.get("agent")) is not None:
         return None
     usage = record.get("usage")
     usage = usage if isinstance(usage, dict) else {}
@@ -112,6 +113,37 @@ def _native_follower(record: dict[str, Any]) -> Follower | None:
     )
 
 
+def _load_native(
+    record: dict[str, Any], project_filter: ProjectFilter | None, out: Capture, steps: list[Follower]
+) -> None:
+    """File one native `step`, `measure` or `compaction` record."""
+    if project_filter is not None and not project_filter.keep({"session.id": record.get("session")}):
+        return
+    kind = record.get("kind")
+    if kind == "measure":
+        if (sample := sample_of(record)) is not None:
+            out.samples.append(sample)
+    elif kind == "compaction":
+        if record.get("skip") is not None:
+            out.left_out += 1
+        else:
+            out.native.append(native_compaction_of(record))
+    elif (step := _native_follower(record)) is not None:
+        steps.append(step)
+
+
+def _load_event(name: str, attrs: dict[str, Any], out: Capture) -> None:
+    """File one `api_request` or `compaction` log event."""
+    if name == COMPACTION:
+        if str(attrs.get("success")).lower() == "false":
+            out.left_out += 1
+        else:
+            out.events.append(event_compaction_of(attrs))
+    elif (follower := _event_follower(attrs)) is not None:
+        out.followers.append(follower)
+        out.event_prompts.add((follower.session, follower.prompt))
+
+
 def load_capture(capture: Path, project_filter: ProjectFilter | None = None) -> Capture:
     """Fill samples, compactions and main-loop requests that pass `project_filter`;
     native records are filtered by their session."""
@@ -119,34 +151,15 @@ def load_capture(capture: Path, project_filter: ProjectFilter | None = None) -> 
     steps: list[Follower] = []
     skipped = tr.Skipped()
     for record in tr.capture_records(capture, skipped):
-        kind = record.get("kind")
-        if kind in ("step", "measure", "compaction"):
-            if project_filter is not None and not project_filter.keep({"session.id": record.get("session")}):
-                continue
-            if kind == "measure":
-                if (sample := sample_of(record)) is not None:
-                    out.samples.append(sample)
-            elif kind == "compaction":
-                if record.get("skip") is not None:
-                    out.left_out += 1
-                else:
-                    out.native.append(native_compaction_of(record))
-            elif (step := _native_follower(record)) is not None:
-                steps.append(step)
+        if record.get("kind") in ("step", "measure", "compaction"):
+            _load_native(record, project_filter, out, steps)
             continue
         for name, attrs in tr.iter_log_events(record.get("payload")):
             if name not in (tr.API_REQUEST, COMPACTION):
                 continue
             if project_filter is not None and not project_filter.keep(attrs):
                 continue
-            if name == COMPACTION:
-                if str(attrs.get("success")).lower() == "false":
-                    out.left_out += 1
-                else:
-                    out.events.append(event_compaction_of(attrs))
-            elif (follower := _event_follower(attrs)) is not None:
-                out.followers.append(follower)
-                out.event_prompts.add((follower.session, follower.prompt))
+            _load_event(name, attrs, out)
     # A prompt that has both events and steps is counted from its events only.
     out.followers += [s for s in steps if (s.session, s.prompt) not in out.event_prompts]
     out.unreadable = skipped.lines
@@ -282,21 +295,7 @@ def _recreation_row(item: Recreation) -> list[str]:
     ]
 
 
-def format_report(report: ContextReport, limit: int | None = None) -> str:
-    if not report.sessions:
-        return with_unreadable("No context measurements or compactions found.", report.unreadable)
-    shown = report.sessions[: limit or DEFAULT_SESSION_LIMIT]
-    shown_ids = {s.session for s in shown}
-    hidden = len(report.sessions) - len(shown)
-    older = f"; {plural(hidden, 'older session')} not shown, raise --limit" if hidden else ""
-    fill_table = format_table(FILL_HEADER, [_fill_row(s) for s in shown], left=1, text=(1, 8))
-    blocks = [[f"Context fill per session (most recent first{older})", *fill_table, *FILL_LEGEND]]
-    recreations = [r for r in report.recreations if r.compaction.session in shown_ids]
-    if recreations:
-        table = format_table(RECREATION_HEADER, [_recreation_row(r) for r in recreations], left=1, text=(1, 2))
-        blocks.append(["Compactions and the cache re-created after each", *table, *RECREATION_LEGEND])
-    else:
-        blocks.append(["Compactions and the cache re-created after each", "  none recorded"])
+def _report_notes(report: ContextReport, shown: list[SessionFill], recreations: list[Recreation]) -> list[str]:
     notes = []
     without = sum(not s.samples for s in shown)
     if without:
@@ -315,6 +314,24 @@ def format_report(report: ContextReport, limit: int | None = None) -> str:
         notes.append(f"  {plural(report.left_out, 'skipped or failed compaction attempt')} left out")
     if report.unreadable:
         notes.append(f"  {unreadable_note(report.unreadable)}")
-    if notes:
+    return notes
+
+
+def format_report(report: ContextReport, limit: int | None = None) -> str:
+    if not report.sessions:
+        return with_unreadable("No context measurements or compactions found.", report.unreadable)
+    shown = report.sessions[: limit or DEFAULT_SESSION_LIMIT]
+    shown_ids = {s.session for s in shown}
+    hidden = len(report.sessions) - len(shown)
+    older = f"; {plural(hidden, 'older session')} not shown, raise --limit" if hidden else ""
+    fill_table = format_table(FILL_HEADER, [_fill_row(s) for s in shown], left=1, text=(1, 8))
+    blocks = [[f"Context fill per session (most recent first{older})", *fill_table, *FILL_LEGEND]]
+    recreations = [r for r in report.recreations if r.compaction.session in shown_ids]
+    if recreations:
+        table = format_table(RECREATION_HEADER, [_recreation_row(r) for r in recreations], left=1, text=(1, 2))
+        blocks.append(["Compactions and the cache re-created after each", *table, *RECREATION_LEGEND])
+    else:
+        blocks.append(["Compactions and the cache re-created after each", "  none recorded"])
+    if notes := _report_notes(report, shown, recreations):
         blocks.append(["Notes", *notes])
     return "\n\n".join("\n".join(block) for block in blocks)

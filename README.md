@@ -3,7 +3,10 @@
 `usage-observer` is a Claude Code plugin that records what your sessions spend (models, tokens, cost,
 context fill, tools, subagents, skills, plugins) as names, sizes and counts, into a file inside your own
 project. It then turns that file into reports that help you decide how to use Claude well: which models,
-subagents, skills and plugins are worth their token cost. The plugin itself sends nothing off your machine.
+subagents, skills and plugins are worth their token cost. While you work, the plugin also draws a status line
+(a modeline) under the prompt that shows how long your prompt caches stay warm and what returning to a cold one
+would cost, and it can tell you in the transcript when one subagent runs far longer or larger than its limits (set from your own
+past subagents once calibrated). The plugin itself sends nothing off your machine.
 
 - **Local only.** The plugin opens no port and makes no network call. The capture stays in the project's
   `logs/` directory and is kept out of git. Output you ask Claude about through the skills goes to the model
@@ -32,7 +35,7 @@ Without a ref, `marketplace add` follows the repository's default branch, `stabl
 versions only (`main` is development). To pin a release or pick a branch, add a ref after `#`:
 
 ```bash
-claude plugin marketplace add alexlesang/claude-observer#usage-observer--v0.6.0
+claude plugin marketplace add alexlesang/claude-observer#usage-observer--v0.7.0
 ```
 
 Update with `claude plugin update usage-observer@usage-observer`, then `/reload-plugins`.
@@ -54,6 +57,47 @@ fails or no Python is found. See "Limits" for sessions that never capture.
 In a session, `/observer` opens a pane with two tabs. *This session* shows this session's tokens by model, cache hit
 rate, cost, context fill, subagents and most used tools. *Project* shows the tool report over this project's
 capture and a usage report over this project's session transcripts.
+
+### The status line (cache line)
+
+The plugin draws one status line of its own (seen as a row above your own `statusLine` with
+`fullscreenLayout` on, on Claude Code 2.1.322 only; only the terminal was checked).
+It is on by default and shows each prompt cache's lifetime, the time left and the dollar price of a cold return, for
+the main session and up to three subagents:
+
+```text
+cache main 1h, 59m left, cold $1.00 | sub1 5m, 2:10 left
+```
+
+- A subagent that is still warm shows no price. Once a cache is within its last minute (a 5-minute cache) or last
+  10 minutes (a 1-hour cache), the time reads `URGENT 0:55 left`; once it has expired, `EXPIRED`, and the cold price
+  stays on the line. More than three subagents collapse into `+N more`, and the line is cut to about 120
+  characters.
+- The cold price is an estimate: the request's whole prompt and its last output, priced as a fresh cache write at
+  the table rate of the model. A model the plugin has no price for shows `$?`.
+- The lifetime (5 minutes or 1 hour) is read again after every step from the end of the session transcript, because
+  it can drop from 1 hour to 5 minutes mid-session. The line never shows more time than there is: an unknown
+  lifetime counts as 5 minutes (`5m?`, with the words `lifetime unknown: 5m assumed`), and while a cache is on
+  5 minutes and you are at or past a plan limit it says `past plan limit: 5m cache`. Before the first request it reads `cache: no request yet`.
+- The text is built from fixed words, the labels `main` and `sub1`, `sub2`, ..., and numbers; no prompt text, path,
+  id or model name reaches it. It only observes: it never pings, never calls the network and never stops a
+  subagent.
+- To turn it off, set the `cacheLine` plugin option to `false`. It is designed to apply to a running session without
+  a reload, but that is not yet confirmed on a live session; whether the row then clears from the screen is
+  UNVERIFIED.
+
+What was seen on Claude Code 2.1.322 with `fullscreenLayout` on (other versions and settings were not checked): the
+harness puts a warning glyph and the plugin's name in front of the line, and the line sits on its own row above your
+`statusLine`, both visible while you type and during a streaming turn. Both are hidden in the detailed transcript view and while a dialog such as
+`/help` is open.
+
+### Subagent alerts
+
+The plugin tells you when a subagent passes a size limit (tokens used) or a time limit (active time), each alert at
+most once per subagent (a restart before the tally is saved can repeat it), as one line in the transcript and one in the `/observer` pane. Until you calibrate, the limits are 10,000,000 tokens
+and 2 hours. Ask Claude to run the `calibrate-alerts` skill to set limits from your own past subagents (it needs at
+least 100 of them, and it writes `alert-calibration.json` next to the capture only after you agree to the numbers).
+Turn the alerts off with the `subagentAlerts` plugin option. Like the cache line, the alerts only observe.
 
 ### Ask Claude: the `usage-reflection` skill
 
@@ -181,6 +225,12 @@ happy with every line. The `--keep` flag leaves the scrubbed, unprojected workin
   The exception is `report --failures`: it joins failed tool calls to the transcripts and prints each call's tool
   input and error text, so treat its output like session text. `--reasoning` reads transcripts too but
   prints counts only (`--tools` reads only the capture). None of these sends anything anywhere.
+- **The status line and the alerts read during the session.** After a model step the plugin reads the end of the
+  session transcript (and a subagent's own transcript) with `tail -c`, only to find the cache lifetime of the last
+  response; it keeps just `5m`, `1h` or `unknown`, and the text read is not stored, logged or written. At session
+  start it reads `alert-calibration.json` next to the capture (a regular file of at most 64 KiB that git does not track; only its numbers
+  are used). Its counts live in Claude Code's own state and store, not in the capture. What it shows on screen
+  is the fixed words, labels and numbers described above, and a dollar figure. `SECURITY.md` lists each call.
 - **Scrubbing is a filter, not a guarantee.** Records are cleaned by attribute name, in key-style spellings.
   An attribute under another name is kept, so the capture can hold whatever else Claude Code puts in its
   events, and free text that holds a value in an unusual shape is written as it is. Names you chose (session
@@ -243,6 +293,15 @@ Claude Code's own `/usage` (last 24 hours or 7 days), `/context` (the current se
 
 Issues and pull requests are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Release notes are in
 [CHANGELOG.md](CHANGELOG.md).
+
+Before a release the maintainer runs five checks: correctness, code quality, privacy, supply chain and
+compatibility with Claude Code. The supply-chain scanners and the compatibility run need network access (the
+compatibility run runs four Claude Code builds: it downloads the minimum, stable and latest builds into a scratch
+directory and runs the installed one without changing it). The CI workflows pin Claude Code by version and integrity
+hash, and the weekly supply-chain workflow pins the scanners by sha256; the release-time runs are not pinned: the
+scanner run uses whatever scanners are on the path (the operator records their versions), and the compatibility run looks up the
+stable and latest builds at run time and checks each against its manifest's sha256. The privacy check over real captures is run by the maintainer by
+hand; no agent opens a capture.
 
 ## License
 

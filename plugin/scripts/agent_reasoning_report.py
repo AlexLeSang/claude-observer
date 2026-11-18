@@ -15,7 +15,9 @@ Effort comes from the capture: an assistant message's `requestId` equals the
 better is not measured here.
 
 The reasoning cost is an estimate: reasoning tokens at the model's output
-price, five times its input price (checked against a captured `cost_usd`).
+price, five times its input price (checked against a captured `cost_usd`), times
+`model_prices.speed_factor` of the message's usage: a fast-mode message on a model that has
+fast mode costs twice that.
 """
 
 from __future__ import annotations
@@ -30,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agent_tool_report as tr
 import transcript_iterator as ti
 from agent_iteration_report import MAIN, format_table
-from model_prices import OUTPUT_PRICE_FACTOR, model_prices, prompt_tokens, unpriced_footer
+from model_prices import OUTPUT_PRICE_FACTOR, model_prices, prompt_tokens, speed_factor, unpriced_footer
 from safe_name import subagent_label
 
 if TYPE_CHECKING:
@@ -60,6 +62,7 @@ class Message:
     request_id: str | None
     timestamp: str
     prompt_tokens: float = 0.0  # input + cache read + cache write: picks the rate card
+    price_factor: float = 1.0  # `model_prices.speed_factor` of the usage: the fast-mode multiple, else 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,6 +157,7 @@ def read_messages(directories: Iterable[Path], report: ReasoningReport) -> None:
                     request_id=event.request_id,
                     timestamp=event.timestamp or "",
                     prompt_tokens=prompt_tokens(event.usage) if isinstance(event.usage, dict) else 0.0,
+                    price_factor=speed_factor(event.usage, event.model) if isinstance(event.usage, dict) else 1.0,
                 )
             )
 
@@ -213,7 +217,7 @@ class Totals:
         else:
             self.priced_messages += 1
             self.priced_thinking += message.thinking
-            self.cost += message.thinking * prices[0] * OUTPUT_PRICE_FACTOR / 1_000_000
+            self.cost += message.thinking * prices[0] * OUTPUT_PRICE_FACTOR * message.price_factor / 1_000_000
         if request is not None and request.cost is not None:
             self.request_cost += request.cost
             self.request_costed += 1

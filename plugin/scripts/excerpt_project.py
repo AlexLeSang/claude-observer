@@ -147,7 +147,7 @@ _MODEL = re.compile(
     r"(?:-[0-9]{8}|-latest)?|opus|sonnet|haiku|opusplan)(?:\[1m\])?",
     re.ASCII,
 )
-_VERSION = re.compile(r"[0-9]{1,4}(?:\.[0-9]{1,4}){2}", re.ASCII)
+VERSION = re.compile(r"[0-9]{1,4}(?:\.[0-9]{1,4}){2}", re.ASCII)
 _TS = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2})(?::[0-9]{2}(?:\.[0-9]{1,9})?)?Z", re.ASCII)
 
 
@@ -226,7 +226,7 @@ def _pattern(regex: re.Pattern[str]) -> Any:
 
 
 model = _pattern(_MODEL)
-version = _pattern(_VERSION)
+version = _pattern(VERSION)
 
 
 def name(category: str, builtin: frozenset[str] = frozenset()) -> Any:
@@ -462,6 +462,20 @@ ALLOWED_KEYS = frozenset(
 # ---- the net ----------------------------------------------------------------------------------------------------
 
 
+def _scalar_ok(value: object) -> bool:
+    """Whether `value` is an allowed leaf: null, a boolean, a grammar-checked string, an exact int or float in
+    range. Any other type (bytes, a subclass of int, a tuple, ...) is not."""
+    if value is None or isinstance(value, bool):
+        return True
+    if isinstance(value, str):
+        return bool(STRING_OK.fullmatch(value))
+    if type(value) is int:
+        return 0 <= value <= MAX_NUM
+    if type(value) is float:
+        return math.isfinite(value) and 0 <= value <= MAX_FLOAT
+    return False
+
+
 def check_projection(value: object, depth: int = 0) -> None:
     """Raise `ProjectionRefused` unless `value` is built only of allowed keys, grammar-checked strings, bounded
     numbers, booleans and null."""
@@ -475,18 +489,7 @@ def check_projection(value: object, depth: int = 0) -> None:
     elif isinstance(value, list):
         for item in value:
             check_projection(item, depth + 1)
-    elif isinstance(value, str):
-        if not STRING_OK.fullmatch(value):
-            raise ProjectionRefused
-    elif value is None or isinstance(value, bool):
-        return
-    elif type(value) is int:
-        if not 0 <= value <= MAX_NUM:
-            raise ProjectionRefused
-    elif type(value) is float:
-        if not (math.isfinite(value) and 0 <= value <= MAX_FLOAT):
-            raise ProjectionRefused
-    else:
+    elif not _scalar_ok(value):
         raise ProjectionRefused
 
 
@@ -502,7 +505,7 @@ def project_record(record: dict[str, Any], names: Names) -> dict[str, Any]:
 # ---- reading lines ----------------------------------------------------------------------------------------------
 
 
-class _Repeated(ValueError):  # noqa: N818
+class _Repeated(ValueError):  # noqa: N818 - a private signal, not an error name
     pass
 
 

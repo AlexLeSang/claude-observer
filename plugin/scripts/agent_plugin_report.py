@@ -659,9 +659,14 @@ def declarers(declared: Mapping[str, list[tuple[str, str]]], event: str, tool: s
     return sorted({name for matcher, name in declared.get(event, []) if _matches(matcher, tool)})
 
 
-def _hook_successes(path: Path) -> Iterator[dict[str, Any]]:
+def _hook_successes(path: Path, root: Path | None = None) -> Iterator[dict[str, Any]]:
+    """The `hook_success` attachments of one transcript. Opened like every transcript read (`ti.open_regular`): a
+    FIFO named `*.jsonl` would block `Path.open` forever, and a link is not followed."""
+    fd = ti.open_regular(path, root)  # never blocks on a FIFO; refuses a symlink, a link below `root`
+    if fd is None:
+        return
     try:
-        with path.open(encoding="utf-8", errors="replace") as handle:
+        with os.fdopen(fd, encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 if HOOK_SUCCESS not in line:  # cheap test before parsing a large transcript
                     continue
@@ -686,7 +691,7 @@ def hook_overhead(sessions: set[str], dirs: list[Path], local: LocalPlugins) -> 
             if context.session_id not in sessions:
                 continue
             overhead.transcripts += 1
-            for attachment in _hook_successes(context.transcript_path):
+            for attachment in _hook_successes(context.transcript_path, context.root):
                 owners = declared.get((str(attachment.get("hookEvent")), str(attachment.get("command"))), set())
                 label = next(iter(owners)) if len(owners) == 1 else AMBIGUOUS if owners else NOT_A_PLUGIN
                 row = overhead.rows[label]

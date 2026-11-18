@@ -8,7 +8,7 @@ It scans the project home's `logs/` (rotated files, per-label split directories,
 lines are counted under each figure. Counts only: no attribute value, line content or line number is
 ever printed, and nothing is written, renamed or created.
 
-    removable    OTLP content entries (`prompt`, `response`, `tool_*`) the scrub removes
+    removable    OTLP content entries (`prompt`, `response`, `tool_*`, `error`) the scrub removes
     serialized   JSON text in a string value that `mod_capture_append.drop_sensitive` would change
     unparseable  a line that is not a JSON object and still names a content or identity key, or one the scrub
                  keeps and counts as unscrubbed (a complete object too deep to parse, nested past 100 levels,
@@ -46,7 +46,7 @@ from capture_paths import project_home
 from safe_name import name_is_clean
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterable, Sequence
 
 PLACEHOLDER = "<REDACTED>"  # what Claude Code writes in place of content when content logging is off
 CAPTURE_NAMES = ("agent-telemetry.jsonl", "agent-telemetry.mod.jsonl")
@@ -128,66 +128,87 @@ def _changes(text: str) -> bool:
         return True
 
 
+class _Walk:
+    """The state of one `_classify_record` walk: the content entries met, the nodes visited and the flags."""
+
+    def __init__(self, tick: Callable[[], None] | None) -> None:
+        self.tick = tick
+        self.content = self.placeholder = self.nodes = 0
+        self.serialized = self.names = self.too_deep = self.identity = False
+        # (node, depth as the scrub counts it, None under an identity entry: the scrub removes those unread)
+        self.stack: list[tuple[Any, int | None]] = []
+
+    def entry_counted(self, item: object) -> bool:
+        """Count `item` when it is a content entry (kept apart from the walk: it is judged whole)."""
+        if not isinstance(item, dict) or not sc.is_content_entry(item):
+            return False
+        self.content += 1
+        if item == {"key": item.get("key"), "value": {"stringValue": PLACEHOLDER}}:  # no other field
+            self.placeholder += 1
+        return True
+
+    def start(self, record: dict[str, Any]) -> None:
+        if not self.entry_counted(record):  # an entry: dropped whole
+            self.stack.append((record, 0))
+        self.identity = mca.is_identity_entry(record)
+
+    def run(self) -> None:
+        while self.stack:
+            node, depth = self.stack.pop()
+            self.nodes += 1
+            if depth is not None and depth > mca.MAX_RECORD_DEPTH:
+                self.too_deep = True  # `drop_content` refuses it: the scrub keeps the line and counts it unscrubbed
+                depth = None
+            if self.tick is not None and self.nodes % WALK_CHECK == 0:
+                self.tick()
+            if isinstance(node, dict):
+                self._names(node)
+                self._keys(node)
+                self._push(node.values(), depth)
+            elif isinstance(node, list):
+                self._push(node, depth)
+            elif isinstance(node, str) and not self.serialized:
+                self.serialized = _changes(node)
+
+    def _names(self, node: dict[Any, Any]) -> None:
+        label = node.get("key")  # an OTLP attribute: {"key": <name key>, "value": {"stringValue": <name>}}
+        value = node.get("value")
+        if isinstance(label, str) and label in NAME_KEYS and isinstance(value, dict):
+            self.names = self.names or not name_is_clean(value.get("stringValue"))
+
+    def _keys(self, node: dict[Any, Any]) -> None:
+        for key, item in node.items():
+            if not isinstance(key, str):
+                continue
+            if key in NAME_KEYS and not name_is_clean(item):
+                self.names = True
+            if mca.is_identity(key):
+                self.identity = True
+            elif not self.serialized and mca._names_a_key(key):  # noqa: SLF001  JSON text used as a key
+                self.serialized = True
+
+    def _push(self, items: Iterable[Any], depth: int | None) -> None:
+        for item in items:
+            if self.entry_counted(item):  # an entry as a value or list item: the scrub drops it too
+                continue
+            identity_entry = mca.is_identity_entry(item)
+            self.identity = self.identity or identity_entry
+            self.stack.append((item, None if depth is None or identity_entry else depth + 1))
+
+
 def _classify_record(record: dict[str, Any], tick: Callable[[], None] | None = None) -> Verdict:
     """The figures for a line that parsed as an object. An iterative walk, so no depth the parser accepted
     can exhaust the recursion limit. A content entry is judged whole and its value is not walked."""
-    content = placeholder = nodes = 0
-    serialized = names = too_deep = False
-
-    def entry_counted(item: object) -> bool:
-        """Count `item` when it is a content entry (kept apart from the walk: it is judged whole)."""
-        nonlocal content, placeholder
-        if not isinstance(item, dict) or not sc.is_content_entry(item):
-            return False
-        content += 1
-        if item == {"key": item.get("key"), "value": {"stringValue": PLACEHOLDER}}:  # no other field
-            placeholder += 1
-        return True
-
-    # (node, depth as the scrub counts it, None under an identity entry: the scrub removes those unread)
-    stack: list[tuple[Any, int | None]] = [] if entry_counted(record) else [(record, 0)]  # an entry: dropped whole
-    identity = mca.is_identity_entry(record)
-    while stack:
-        node, depth = stack.pop()
-        nodes += 1
-        if depth is not None and depth > mca.MAX_RECORD_DEPTH:
-            too_deep = True  # `drop_content` refuses it: the scrub keeps the line and counts it unscrubbed
-            depth = None
-        if tick is not None and nodes % WALK_CHECK == 0:
-            tick()
-        if isinstance(node, dict):
-            label = node.get("key")  # an OTLP attribute: {"key": <name key>, "value": {"stringValue": <name>}}
-            value = node.get("value")
-            if isinstance(label, str) and label in NAME_KEYS and isinstance(value, dict):
-                names = names or not name_is_clean(value.get("stringValue"))
-            for key, item in node.items():
-                if isinstance(key, str):
-                    if key in NAME_KEYS and not name_is_clean(item):
-                        names = True
-                    if mca.is_identity(key):
-                        identity = True
-                    elif not serialized and mca._names_a_key(key):  # noqa: SLF001  JSON text used as a key
-                        serialized = True
-                if entry_counted(item):  # an entry as a dict value: the scrub drops it too
-                    continue
-                if mca.is_identity_entry(item):
-                    identity = True
-                stack.append((item, None if depth is None or mca.is_identity_entry(item) else depth + 1))
-        elif isinstance(node, list):
-            for item in node:
-                if entry_counted(item):
-                    continue
-                identity = identity or mca.is_identity_entry(item)
-                stack.append((item, None if depth is None or mca.is_identity_entry(item) else depth + 1))
-        elif isinstance(node, str) and not serialized:
-            serialized = _changes(node)
+    walk = _Walk(tick)
+    walk.start(record)
+    walk.run()
     return Verdict(
-        removable=content > placeholder,
-        serialized=serialized,
-        identity=identity,
-        redacted=content > 0 and content == placeholder,
-        names=names,
-        unparseable=too_deep,
+        removable=walk.content > walk.placeholder,
+        serialized=walk.serialized,
+        identity=walk.identity,
+        redacted=walk.content > 0 and walk.content == walk.placeholder,
+        names=walk.names,
+        unparseable=walk.too_deep,
     )
 
 
@@ -210,7 +231,7 @@ def classify(text: str, tick: Callable[[], None] | None = None) -> Verdict:
             if pieces != [text]:
                 verdicts = [classify(piece, tick) for piece in pieces if piece.strip()]
                 return Verdict(**{name: any(getattr(v, name) for v in verdicts) for name in FIGURES})
-        if (kept or too_deep) and sc._is_one_object(text):  # noqa: SLF001
+        if (kept or too_deep) and sc._is_one_object(text):  # noqa: SLF001 - scrub_capture's own parser, shared so the rule is not copied
             return Verdict(unparseable=True)
         return Verdict(
             unparseable=sc.torn_line_is_sensitive(text)
@@ -229,6 +250,75 @@ class _Expired(Exception):  # noqa: N818  not an error: the time budget ran out
     pass
 
 
+class _Oversized:
+    """A line over the cap while it is skipped: only a search window and a few counters are kept."""
+
+    def __init__(self, held: bytearray) -> None:
+        self.hit = _PREFILTER.search(held) is not None
+        self.carry = bytes(held[-_CARRY:])
+        self.brackets = _brackets(held)
+        self.size = len(held)
+        self.escaped = b"\\" in held
+
+    def feed(self, piece: bytes) -> None:
+        window = self.carry + piece
+        self.hit = self.hit or _PREFILTER.search(window) is not None
+        self.carry = window[-_CARRY:]
+        self.brackets += _brackets(piece)
+        self.size += len(piece)
+        self.escaped = self.escaped or b"\\" in piece
+
+    def verdict(self) -> Verdict:
+        """A line over the cap is not parsed. It is unparseable when it names something, and also when it could nest
+        past the shallowest depth the scrub refuses (`mca.may_exceed_depth`): the scrub parses it whatever its length."""
+        return Verdict(unparseable=self.hit or mca.may_exceed_depth(self.brackets, self.size, self.escaped))
+
+
+class _LineReader:
+    """Splits the chunks of one file into lines and counts each into `result`, holding at most `LINE_CAP` bytes."""
+
+    def __init__(self, result: FileResult, expired: Callable[[], bool]) -> None:
+        self.result = result
+        self.expired = expired
+        self.pending = bytearray()  # extended in place: `bytes +=` would copy the whole line each time
+        self.oversized: _Oversized | None = None  # set while skipping a line over the cap
+
+    def feed(self, data: bytes) -> None:
+        pos = 0
+        while pos < len(data):
+            end = data.find(b"\n", pos)
+            piece = data[pos:] if end < 0 else data[pos:end]
+            pos = len(data) if end < 0 else end + 1
+            self._piece(piece, ended=end >= 0)
+
+    def finish(self) -> None:
+        if self.oversized is not None:
+            self._close_oversized(self.oversized)
+        elif self.pending:
+            _scan_line(
+                self.result, bytes(self.pending), self.expired
+            )  # a last line with no newline: a torn tail counts
+
+    def _close_oversized(self, oversized: _Oversized) -> None:
+        _count(self.result, oversized.verdict())
+        self.result.lines += 1
+        self.oversized = None
+
+    def _piece(self, piece: bytes, *, ended: bool) -> None:
+        if self.oversized is not None:
+            self.oversized.feed(piece)
+        else:
+            self.pending += piece
+            if len(self.pending) > LINE_CAP:
+                self.oversized = _Oversized(self.pending)
+                self.pending.clear()
+            elif ended:
+                _scan_line(self.result, bytes(self.pending), self.expired)
+                self.pending.clear()
+        if ended and self.oversized is not None:
+            self._close_oversized(self.oversized)
+
+
 def scan_file(
     result: FileResult,
     handle: IO[bytes],
@@ -236,8 +326,7 @@ def scan_file(
 ) -> None:
     """Read `handle` up to `result.size` (its size at open), line by line, holding at most `LINE_CAP`
     bytes of a line. Raises _Expired between chunks when the budget is gone."""
-    pending = bytearray()  # extended in place: `bytes +=` would copy the whole line each time
-    oversized: list[Any] | None = None  # [hit, carry, brackets, size, escaped] while skipping a line over the cap
+    reader = _LineReader(result, expired)
     offset = 0
     while offset < result.size:
         if expired():
@@ -247,59 +336,15 @@ def scan_file(
             result.error = "file shrank during the scan"
             return
         offset += len(data)
-        pos = 0
-        while pos < len(data):
-            end = data.find(b"\n", pos)
-            piece = data[pos:] if end < 0 else data[pos:end]
-            pos = len(data) if end < 0 else end + 1
-            if oversized is not None:
-                window = oversized[1] + piece
-                oversized[0] = oversized[0] or _PREFILTER.search(window) is not None
-                oversized[1] = window[-_CARRY:]
-                oversized[2] += _brackets(piece)
-                oversized[3] += len(piece)
-                oversized[4] = oversized[4] or b"\\" in piece
-                if end >= 0:
-                    _count(result, _oversized_verdict(oversized))
-                    result.lines += 1
-                    oversized = None
-                continue
-            pending += piece
-            if len(pending) > LINE_CAP:
-                oversized = [
-                    _PREFILTER.search(pending) is not None,
-                    bytes(pending[-_CARRY:]),
-                    _brackets(pending),
-                    len(pending),
-                    b"\\" in pending,
-                ]
-                pending.clear()
-                if end >= 0:
-                    _count(result, _oversized_verdict(oversized))
-                    result.lines += 1
-                    oversized = None
-                continue
-            if end >= 0:
-                _scan_line(result, bytes(pending), expired)
-                pending.clear()
+        reader.feed(data)
         result.bytes_scanned = offset
-    if oversized is not None:
-        _count(result, _oversized_verdict(oversized))
-        result.lines += 1
-    elif pending:
-        _scan_line(result, bytes(pending), expired)  # a last line with no newline: a torn tail counts
+    reader.finish()
 
 
 def _brackets(data: bytes | bytearray) -> int:
     """`{` and `[` bytes in `data`: the ways to open a level that `mca.may_exceed_depth` counts. A bracket spelled
     as an escape (`\\u007b`) is not counted: the escape alone makes `_PREFILTER` parse the line."""
     return data.count(b"{") + data.count(b"[")
-
-
-def _oversized_verdict(state: list[Any]) -> Verdict:
-    """A line over the cap is not parsed. It is unparseable when it names something, and also when it could nest
-    past the shallowest depth the scrub refuses (`mca.may_exceed_depth`): the scrub parses it whatever its length."""
-    return Verdict(unparseable=state[0] or mca.may_exceed_depth(state[2], state[3], state[4]))
 
 
 def _scan_line(result: FileResult, line: bytes, expired: Callable[[], bool]) -> None:
@@ -441,6 +486,50 @@ def _open(result: FileResult) -> IO[bytes] | None:
     return handle
 
 
+def _open_all(
+    paths: list[Path],
+    home: Path,
+    results: list[FileResult],
+    opened: list[tuple[FileResult, IO[bytes] | None]],
+) -> bool:
+    """Open each file in turn, adding to `results` and `opened` as it goes (so a caller that fails part-way can
+    still close what is open). Returns whether the process ran out of descriptors: the files after that point
+    are left to be opened at their turn."""
+    out_of_descriptors = False
+    for path in paths:
+        result = FileResult(path, _shown(path, home))
+        results.append(result)
+        if out_of_descriptors:
+            opened.append((result, None))
+            continue
+        handle = _open(result)
+        if result.error and result.error.startswith(("EMFILE", "ENFILE")):
+            out_of_descriptors, result.error = True, None
+            opened.append((result, None))  # opened at its turn
+        elif handle is not None:
+            opened.append((result, handle))
+    return out_of_descriptors
+
+
+def _scan_opened(
+    opened: list[tuple[FileResult, IO[bytes] | None]], expired: Callable[[], bool], out_of_descriptors: bool
+) -> None:
+    for position, (result, handle) in enumerate(opened):
+        if handle is None:
+            handle = _open(result)  # deferred: a descriptor is free again
+            if handle is None:
+                continue
+            opened[position] = (result, handle)
+        try:
+            scan_file(result, handle, expired)
+        except _Expired:  # one unreadable file is recorded, the rest are still read
+            pass
+        except OSError as error:
+            result.error = _error_name(error)
+        if out_of_descriptors:
+            handle.close()  # frees the descriptor for the next deferred file
+
+
 def run(
     paths: list[Path],
     home: Path,
@@ -456,38 +545,13 @@ def run(
     for path, error in listing_errors:
         results.append(FileResult(path, _shown(path, home), error=_error_name(error)))
     try:
-        out_of_descriptors = False
-        for path in paths:
-            result = FileResult(path, _shown(path, home))
-            results.append(result)
-            if out_of_descriptors:
-                opened.append((result, None))
-                continue
-            handle = _open(result)
-            if result.error and result.error.startswith(("EMFILE", "ENFILE")):
-                out_of_descriptors, result.error = True, None
-                opened.append((result, None))  # opened at its turn
-            elif handle is not None:
-                opened.append((result, handle))
+        out_of_descriptors = _open_all(paths, home, results, opened)
         start = clock()
 
         def expired() -> bool:
             return max_seconds > 0 and clock() - start > max_seconds
 
-        for position, (result, handle) in enumerate(opened):
-            if handle is None:
-                handle = _open(result)  # deferred: a descriptor is free again
-                if handle is None:
-                    continue
-                opened[position] = (result, handle)
-            try:
-                scan_file(result, handle, expired)
-            except _Expired:  # one unreadable file is recorded, the rest are still read
-                pass
-            except OSError as error:
-                result.error = _error_name(error)
-            if out_of_descriptors:
-                handle.close()  # frees the descriptor for the next deferred file
+        _scan_opened(opened, expired, out_of_descriptors)
     finally:
         for _, handle in opened:
             if handle is not None:
@@ -605,7 +669,7 @@ def main(
         looked_at = [root]
         paths, listing_errors = _default_set(root)
         extra = os.environ.get("CLAUDE_OBSERVER_CAPTURE")
-        if extra and not Path(os.path.abspath(extra)).is_relative_to(root):  # noqa: PTH100
+        if extra and not Path(os.path.abspath(extra)).is_relative_to(root):  # noqa: PTH100 - abspath, unlike resolve, does not follow a link
             _add_family(Path(extra), paths, listing_errors)
     paths = _unique(paths)
     if not paths and not listing_errors:

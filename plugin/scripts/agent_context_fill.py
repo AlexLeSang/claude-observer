@@ -80,7 +80,7 @@ def sample_of(record: dict[str, Any]) -> Sample | None:
     return Sample(text_of(record.get("session")), text_of(record.get("ts"), ""), tokens, window, percent)
 
 
-def _agent_of(value: object) -> str | None:
+def agent_of(value: object) -> str | None:
     """The compacting agent; absent, null or empty is the main loop, as for OTel events."""
     return text_of(value) if value else None
 
@@ -93,7 +93,7 @@ def native_compaction_of(record: dict[str, Any]) -> Compaction:
         tr.as_number(record.get("tokens_before")),
         tr.as_number(record.get("tokens_after")),
         True,
-        _agent_of(record.get("agent")),
+        agent_of(record.get("agent")),
     )
 
 

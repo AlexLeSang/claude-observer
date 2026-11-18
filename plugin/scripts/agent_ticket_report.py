@@ -96,6 +96,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import transcript_iterator as ti
 from agent_iteration_report import format_table, plural
 from agent_session_report import Capture, Request, Session, Spawn
 from agent_session_report import build_report as build_session_report
@@ -228,6 +229,17 @@ def explicit_ticket(text: str | None, *, anchored: bool) -> str | None:
     if not text:
         return None
     text = text.lstrip("\ufeff")  # a BOM would count as a word before a first-thing `#N`
+    sole = _sole_reference(text)
+    if sole is None:
+        return None
+    digits, first = sole
+    if anchored and not _leads_text(text, first):
+        return None
+    return _plain(digits)
+
+
+def _sole_reference(text: str) -> tuple[str, re.Match[str]] | None:
+    """The one id `text` names and the first reference to it, or None when it names none or several."""
     if _RANGE_RE.search(text):
         return None
     found = list(_REF_RE.finditer(text))
@@ -238,16 +250,15 @@ def explicit_ticket(text: str | None, *, anchored: bool) -> str | None:
     if len(ids) != 1:
         return None
     digits = ids.pop()
-    if digits == "0":  # board ids start at 1
-        return None
-    if anchored:
-        first = found[0]
-        head = text[: first.start()].lstrip()
-        # A bare `#N` counts only as the very first thing (`#N: fix it`): mid-sentence it is as
-        # likely a colour (`#N`) or a PR number as a ticket.
-        if not _LEAD_RE.fullmatch(head) or (first.lastindex == _BARE_GROUP and head):
-            return None
-    return _plain(digits)
+    return None if digits == "0" else (digits, found[0])  # board ids start at 1
+
+
+def _leads_text(text: str, first: re.Match[str]) -> bool:
+    """Whether the reference `first` comes first in `text`, after at most `PROMPT_LEAD_WORDS` words."""
+    head = text[: first.start()].lstrip()
+    # A bare `#N` counts only as the very first thing (`#N: fix it`): mid-sentence it is as
+    # likely a colour (`#N`) or a PR number as a ticket.
+    return bool(_LEAD_RE.fullmatch(head)) and not (first.lastindex == _BARE_GROUP and head)
 
 
 def branch_ticket(branch: str | None, *, sub: bool = False) -> str | None:
@@ -481,35 +492,15 @@ def _prompt_text(message: object) -> str | None:
     return real_prompt_text(message.get("content") if isinstance(message, dict) else None)
 
 
-def _open_regular(path: Path) -> int | None:
-    """A read-only fd for a regular, non-symlink file, else None. Never blocks on a FIFO."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        return None
-    try:
-        if stat.S_ISREG(os.fstat(fd).st_mode):
-            return fd
-    except OSError:
-        pass
-    os.close(fd)
-    return None
-
-
-def _read_records(path: Path) -> Iterator[dict[str, object]]:
-    """The JSON objects of a JSONL transcript, like `ti.read_jsonl` but bounded: `_scan_records`
-    without its gap markers."""
-    return (record for record in _scan_records(path) if record is not None)
-
-
-def _scan_records(path: Path) -> Iterator[dict[str, object] | None]:
+def _scan_records(path: Path, root: Path | None = None) -> Iterator[dict[str, object] | None]:
     """The JSON objects of a JSONL transcript, bounded, and `None` for each line dropped on the way.
 
-    A symlink or non-regular file reads as empty. A line over MAX_LINE_BYTES is dropped and never held whole
-    (a 300 MB single line took 737 MB); reading stops after MAX_TRANSCRIPT_BYTES. A line that is not JSON (bad
+    A symlink or non-regular file reads as empty, and so does a file below a symlinked directory when `root` (the
+    project directory it was listed under) is given: the shared `ti.open_regular`. A line over MAX_LINE_BYTES is
+    dropped and never held whole (a 300 MB single line took 737 MB); reading stops after MAX_TRANSCRIPT_BYTES. A line that is not JSON (bad
     UTF-8, a torn line) is dropped too. Each drop yields `None`, so a reader of "the first X" knows a line it
     never saw may have been it. A blank line and a JSON line that is not an object are skipped silently."""
-    fd = _open_regular(path)
+    fd = ti.open_regular(path, root)  # the shared choke point; never blocks on a FIFO
     if fd is None:
         return
     total = 0
@@ -539,10 +530,10 @@ def _scan_records(path: Path) -> Iterator[dict[str, object] | None]:
         return
 
 
-def _read_meta(path: Path) -> dict[str, object]:
+def _read_meta(path: Path, root: Path | None = None) -> dict[str, object]:
     """The `.meta.json` next to a subagent transcript: {} for a symlink, non-regular file, oversized,
-    unreadable, invalid or non-object file."""
-    fd = _open_regular(path)
+    unreadable, invalid or non-object file, or one below a symlinked directory when `root` is given."""
+    fd = ti.open_regular(path, root)  # the shared choke point; never blocks on a FIFO
     if fd is None:
         return {}
     try:
@@ -673,41 +664,60 @@ def read_subagent_runs(
     for directory in _project_directories(project_dir):
         for session_id, transcript_path in _subagent_transcripts(directory, sessions):
             key = (session_id, transcript_path.stem.removeprefix("agent-"))
-            if key in runs:
-                continue
-            meta = _read_meta(transcript_path.with_suffix(".meta.json"))
-            description = _meta_str(meta, "description")
-            prompt: str | None = None
-            branches: list[str] = []
-            seen_prompt = False
-            dropped = False  # as in `read_evidence`: no dispatch prompt after a dropped line
-            for record in _scan_records(transcript_path):
-                if record is None:
-                    dropped = True
-                    continue
-                branch = record.get("gitBranch")
-                if isinstance(branch, str) and branch and branch not in branches:
-                    branches.append(branch)
-                request_id = record.get("requestId")
-                if record.get("type") == "assistant" and isinstance(request_id, str) and request_id:
-                    by_request.setdefault((session_id, request_id), key)
-                elif record.get("type") == "user" and not seen_prompt:
-                    seen_prompt = True
-                    prompt = None if dropped else _prompt_text(record.get("message"))
-            # `.meta.json` is untrusted: a non-string `agentType` is no type at all.
-            agent_type = clean_name(meta.get("agentType"))
-            run = SubRun(agent_type=agent_type, phase=_sub_phase(agent_type, description, prompt, branches))
-            from_description = explicit_ticket(description, anchored=False)
-            from_prompt = explicit_ticket(prompt, anchored=True)
-            from_branch = next((t for b in branches if (t := branch_ticket(b, sub=True))), None)
-            if from_description:
-                run.ticket, run.source = from_description, "description"
-            elif from_prompt:
-                run.ticket, run.source = from_prompt, "dispatch"
-            elif from_branch:
-                run.ticket, run.source = from_branch, "sub-branch"
-            runs[key] = run
+            if key not in runs:
+                runs[key] = _read_run(transcript_path, directory, key, by_request)
     return runs, by_request
+
+
+def _scan_subagent(
+    transcript_path: Path, directory: Path, key: tuple[str, str], by_request: dict[tuple[str, str], tuple[str, str]]
+) -> tuple[str | None, list[str]]:
+    """The dispatch prompt and the branches of one subagent transcript; its request ids go to `by_request`."""
+    prompt: str | None = None
+    branches: list[str] = []
+    seen_prompt = False
+    dropped = False  # as in `read_evidence`: no dispatch prompt after a dropped line
+    for record in _scan_records(transcript_path, directory):
+        if record is None:
+            dropped = True
+            continue
+        branch = record.get("gitBranch")
+        if isinstance(branch, str) and branch and branch not in branches:
+            branches.append(branch)
+        request_id = record.get("requestId")
+        if record.get("type") == "assistant" and isinstance(request_id, str) and request_id:
+            by_request.setdefault((key[0], request_id), key)
+        elif record.get("type") == "user" and not seen_prompt:
+            seen_prompt = True
+            prompt = None if dropped else _prompt_text(record.get("message"))
+    return prompt, branches
+
+
+def _run_ticket(description: str | None, prompt: str | None, branches: list[str]) -> tuple[str | None, str | None]:
+    """(ticket, source) of a run: the description's, else the prompt's, else a branch's."""
+    from_description = explicit_ticket(description, anchored=False)
+    from_prompt = explicit_ticket(prompt, anchored=True)
+    from_branch = next((t for b in branches if (t := branch_ticket(b, sub=True))), None)
+    if from_description:
+        return from_description, "description"
+    if from_prompt:
+        return from_prompt, "dispatch"
+    if from_branch:
+        return from_branch, "sub-branch"
+    return None, None
+
+
+def _read_run(
+    transcript_path: Path, directory: Path, key: tuple[str, str], by_request: dict[tuple[str, str], tuple[str, str]]
+) -> SubRun:
+    meta = _read_meta(transcript_path.with_suffix(".meta.json"), directory)
+    description = _meta_str(meta, "description")
+    prompt, branches = _scan_subagent(transcript_path, directory, key, by_request)
+    # `.meta.json` is untrusted: a non-string `agentType` is no type at all.
+    agent_type = clean_name(meta.get("agentType"))
+    run = SubRun(agent_type=agent_type, phase=_sub_phase(agent_type, description, prompt, branches))
+    run.ticket, run.source = _run_ticket(description, prompt, branches)
+    return run
 
 
 def merge_spawns(runs: dict[tuple[str, str], SubRun], spawns: dict[tuple[str, str], Spawn], sessions: set[str]) -> None:
@@ -865,26 +875,36 @@ class Placement:
     phase: str
 
 
-def build_report(capture: Capture, project_dir: Path | None, board: dict[str, str] | None) -> TicketReport:
-    sdk_sessions = {r.session for r in capture.requests if r.source == SDK_SOURCE}
-    paths = transcript_index(project_dir)
-    parents: dict[str, tuple[Attribution | None, str]] = {}
+class _Placer:
+    """Attributes the sessions of a capture and routes the requests of subagent runs to pseudo-sessions."""
 
-    def parent(session: str) -> tuple[Attribution | None, str]:
+    def __init__(self, capture: Capture, project_dir: Path | None) -> None:
+        self.sdk_sessions = {r.session for r in capture.requests if r.source == SDK_SOURCE}
+        self.paths = transcript_index(project_dir)
+        self.parents: dict[str, tuple[Attribution | None, str]] = {}
+        self.runs: dict[tuple[str, str], SubRun] = {}
+        self.by_request: dict[tuple[str, str], tuple[str, str]] = {}
+        self.placed: dict[str, Placement] = {}
+        self.real_sessions: set[str] = set()
+        self.pseudo_ids: dict[tuple[str, str], str] = {}
+        self.split_from: set[str] = set()
+        self.run_counter = itertools.count()
+
+    def parent(self, session: str) -> tuple[Attribution | None, str]:
         """The attribution and phase of a whole session (sdk sessions with a transcript only)."""
-        if session not in parents:
-            path = paths.get(session) if session in sdk_sessions else None
+        if session not in self.parents:
+            path = self.paths.get(session) if session in self.sdk_sessions else None
             if path is None:
-                parents[session] = (None, BUILD)
+                self.parents[session] = (None, BUILD)
             else:
                 evidence = read_evidence(path)
-                parents[session] = (
+                self.parents[session] = (
                     attribute_ticket(evidence.prompt, evidence.branch, evidence.commits),
                     classify_phase(evidence.prompt, evidence.command),
                 )
-        return parents[session]
+        return self.parents[session]
 
-    def locate(session: str) -> tuple[str, str | None, str]:
+    def locate(self, session: str) -> tuple[str, str | None, str]:
         """The row key, attribution source and phase of a whole session.
 
         An sdk session is attributed by `parent`. An interactive one (no sdk request) only by its branch or
@@ -892,11 +912,11 @@ def build_report(capture: Capture, project_dir: Path | None, board: dict[str, st
         `interactive-`. What stays unmatched is split by why: no transcript read for an sdk session, an
         interactive session, or an sdk transcript that names nothing.
         """
-        found, phase = parent(session)
+        found, phase = self.parent(session)
         if found:
             return found.ticket, found.source, phase
-        path = paths.get(session)
-        if session in sdk_sessions:
+        path = self.paths.get(session)
+        if session in self.sdk_sessions:
             return (UNATTRIBUTED if path else UNATTRIBUTED_NO_TRANSCRIPT), None, phase
         if path is None:
             return UNATTRIBUTED_INTERACTIVE, None, phase
@@ -907,75 +927,78 @@ def build_report(capture: Capture, project_dir: Path | None, board: dict[str, st
             return branch_or_commit.ticket, INTERACTIVE_PREFIX + branch_or_commit.source, phase
         return UNATTRIBUTED_INTERACTIVE, None, phase
 
-    # Subagent requests share the launching session's id. A request whose run can be read from a
-    # subagent transcript (native step: by agent id; api_request: by `request_id`) and has a ticket of
-    # its own, or sits in an attributed session, becomes a pseudo-session per run; the rest stays put.
-    event_prompts = {(r.session, r.prompt) for r in capture.requests if r.loop}
-    steps = [st for st in capture.steps if (st.session, st.prompt) not in event_prompts]
-    runs, by_request = read_subagent_runs(project_dir, {r.session for r in [*capture.requests, *steps] if r.sub})
-    merge_spawns(runs, capture.spawns, {r.session for r in [*capture.requests, *steps] if r.sub})
-    placed: dict[str, Placement] = {}
-    real_sessions = {r.session for r in [*capture.requests, *steps]}
-    pseudo_ids: dict[tuple[str, str], str] = {}
-    split_from: set[str] = set()
-    run_counter = itertools.count()
+    def _run_key(self, request: Request) -> tuple[str, str] | None:
+        if request.agent:
+            return (request.session, request.agent)
+        if request.request_id:
+            return self.by_request.get((request.session, request.request_id))
+        return None
 
-    def route(request: Request) -> Request:
+    def _pseudo_id(self, key: tuple[str, str]) -> str:
+        if key not in self.pseudo_ids:  # an id no real session has: never built from a session id's text
+            taken = self.real_sessions | set(self.pseudo_ids.values())
+            while (candidate := f"\0run{next(self.run_counter)}") in taken:
+                pass
+            self.pseudo_ids[key] = candidate
+        return self.pseudo_ids[key]
+
+    def route(self, request: Request) -> Request:
         if not request.sub:
             return request
-        key = (
-            (request.session, request.agent)
-            if request.agent
-            else by_request.get((request.session, request.request_id))
-            if request.request_id
-            else None
-        )
-        if key is None or key[0] != request.session or key not in runs:
+        key = self._run_key(request)
+        if key is None or key[0] != request.session or key not in self.runs:
             return request
-        run = runs[key]
-        found = parent(request.session)[0]  # sdk sessions only: a ticketless run never joins an interactive one
-        session_phase = locate(request.session)[2]  # but an interactive session's phase still applies
+        run = self.runs[key]
+        found = self.parent(request.session)[0]  # sdk sessions only: a ticketless run never joins an interactive one
+        session_phase = self.locate(request.session)[2]  # but an interactive session's phase still applies
         ticket, source = (
             (run.ticket, run.source) if run.ticket else (found.ticket, found.source) if found else (None, None)
         )
         if ticket is None or source is None:
             return request
-        if key not in pseudo_ids:  # an id no real session has: never built from a session id's text
-            taken = real_sessions | set(pseudo_ids.values())
-            while (candidate := f"\0run{next(run_counter)}") in taken:
-                pass
-            pseudo_ids[key] = candidate
-        pseudo = pseudo_ids[key]
+        pseudo = self._pseudo_id(key)
         # The step's own reviewer subagent beats a spawn type that left the run without a phase (a
         # general-purpose spawn); a transcript's own type still wins over the step.
         own = REVIEW if run.phase is None and run.type_from_spawn and is_reviewer_type(request.subagent) else None
-        placed[pseudo] = Placement(ticket, source, run.phase or own or session_phase)
-        split_from.add(request.session)
+        self.placed[pseudo] = Placement(ticket, source, run.phase or own or session_phase)
+        self.split_from.add(request.session)
         return dataclasses.replace(request, session=pseudo)
 
+    def rows(self, remaining: list[Session]) -> dict[str, TicketRow]:
+        rows: dict[str, TicketRow] = {}
+        for session in remaining:
+            place = self.placed.get(session.session)
+            if place:
+                rows.setdefault(place.ticket, TicketRow(place.ticket)).add(session, place.source, place.phase, run=True)
+                continue
+            ticket, source, phase = self.locate(session.session)
+            rows.setdefault(ticket, TicketRow(ticket)).add(session, source, phase)
+        # A session whose every request was split out still is a session of its ticket (totals match --sessions).
+        for gone in sorted(self.split_from - {s.session for s in remaining}):
+            ticket = self.locate(gone)[0]
+            rows.setdefault(ticket, TicketRow(ticket)).sessions += 1
+        return rows
+
+
+def build_report(capture: Capture, project_dir: Path | None, board: dict[str, str] | None) -> TicketReport:
+    placer = _Placer(capture, project_dir)
+    # Subagent requests share the launching session's id. A request whose run can be read from a
+    # subagent transcript (native step: by agent id; api_request: by `request_id`) and has a ticket of
+    # its own, or sits in an attributed session, becomes a pseudo-session per run; the rest stays put.
+    event_prompts = {(r.session, r.prompt) for r in capture.requests if r.loop}
+    steps = [st for st in capture.steps if (st.session, st.prompt) not in event_prompts]
+    sub_sessions = {r.session for r in [*capture.requests, *steps] if r.sub}
+    placer.runs, placer.by_request = read_subagent_runs(project_dir, sub_sessions)
+    merge_spawns(placer.runs, capture.spawns, sub_sessions)
+    placer.real_sessions = {r.session for r in [*capture.requests, *steps]}
     routed = dataclasses.replace(
-        capture, requests=[route(r) for r in capture.requests], steps=[route(st) for st in steps]
+        capture, requests=[placer.route(r) for r in capture.requests], steps=[placer.route(st) for st in steps]
     )
-    rows: dict[str, TicketRow] = {}
-    remaining = build_session_report(routed).sessions
-    for session in remaining:
-        place = placed.get(session.session)
-        if place:
-            rows.setdefault(place.ticket, TicketRow(place.ticket)).add(session, place.source, place.phase, run=True)
-            continue
-        ticket, source, phase = locate(session.session)
-        rows.setdefault(ticket, TicketRow(ticket)).add(session, source, phase)
-    # A session whose every request was split out still is a session of its ticket (totals match --sessions).
-    for gone in sorted(split_from - {s.session for s in remaining}):
-        ticket = locate(gone)[0]
-        rows.setdefault(ticket, TicketRow(ticket)).sessions += 1
+    rows = placer.rows(build_session_report(routed).sessions)
     for ticket, row in rows.items():
         if not is_unattributed(ticket) and board is not None:
             row.status = board.get(ticket, UNKNOWN_STATUS)
-    ordered = sorted(
-        rows.values(),
-        key=lambda r: ticket_sort_key(r.ticket),
-    )
+    ordered = sorted(rows.values(), key=lambda r: ticket_sort_key(r.ticket))
     return TicketReport(ordered, no_transcripts=project_dir is None)
 
 

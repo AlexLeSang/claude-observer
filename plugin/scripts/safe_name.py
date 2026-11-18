@@ -80,3 +80,23 @@ def printable_text(text: str) -> str:
     newline, tab and the ones a name may keep. It cannot stop a newline: a name is cleaned at its source. The last line of defence for output handed on (the usage-reflection
     runner), after the views have cleaned the names they print."""
     return "".join(c if c in "\n\t" or _keeps(c) else "?" for c in text)
+
+
+def one_line(text: str) -> str:
+    """`printable_text` on one line: a newline, which it keeps, is shown as the two characters `\\n`. For a name or
+    path that goes into a line of its own (`source: ...`), where a newline would start a forged line the next
+    reader (the pane, a model) takes for output."""
+    return printable_text(text).replace("\n", "\\n")
+
+
+def positive_int(text: str) -> int:
+    """An argparse `type=` for a whole number of 1 or more (argparse is imported on refusal only: the appenders load this module)."""
+    import argparse  # noqa: PLC0415  (kept off the appender hot path)
+
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {text!r}")
+    return value

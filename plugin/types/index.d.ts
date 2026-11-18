@@ -42,6 +42,8 @@ declare module 'claude-code' {
       view: ObserverView
       // Per capture path, the ids of the sessions whose session_start is in the capture and not ended.
       announced: Record<string, string[]>
+      // The pane's lines for the running subagents that have fired an alert. Not reseeded on SessionStart.
+      alerts: { lines: string[] }
     }
   }
 }

@@ -116,7 +116,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from capture_paths import default_plugin_capture
-from safe_name import agent_label
+from safe_name import agent_label, positive_int
 
 try:
     import fcntl
@@ -126,7 +126,7 @@ except ImportError:  # no flock (Windows): appenders run unlocked, as before
     _HAS_FLOCK = False
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 # The old OTLP receiver's capture. Only the old-capture tools (scrub_capture, split_capture)
 # default to it; the receiver is gone.
@@ -351,9 +351,9 @@ def _settings_labels(start: Path) -> Iterator[tuple[Path, str]]:
             break
         try:
             settings = _read_trusted_settings(directory)
-            attributes = settings["env"]["OTEL_RESOURCE_ATTRIBUTES"]  # type: ignore[index]
+            attributes = settings["env"]["OTEL_RESOURCE_ATTRIBUTES"]  # type: ignore[index]  # settings is `object` (parsed JSON); a bad shape raises and is caught below
         except (OSError, ValueError, KeyError, TypeError, RecursionError):
-            continue
+            continue  # no usable settings here (missing, bad shape, untrusted): try the parent
         if not isinstance(attributes, str):
             continue
         for pair in attributes.split(","):
@@ -512,7 +512,7 @@ def _warn_once(kind: str, error: OSError, consequence: str = _GROWING) -> None:
     except Exception:  # OSError, ValueError (closed file), UnicodeError, whatever a stream raises
         # The failed text stays in the stream's buffer and its flush at interpreter exit would turn a written
         # record into exit status 120, which the plugin requeues as a duplicate: drop the dead stream.
-        sys.stderr = Path(os.devnull).open("w")  # noqa: SIM115
+        sys.stderr = Path(os.devnull).open("w")  # noqa: SIM115 - the stream replaces sys.stderr for the rest of the process, so no `with`
 
 
 _UNLOCKED = "appending unlocked, so concurrent appenders are not serialised"
@@ -625,7 +625,7 @@ def _rotate(capture: Path, backups: int, retention_days: int, now: float | None)
 
 
 @contextlib.contextmanager
-def _append_lock(capture: Path) -> Iterator[None]:
+def append_lock(capture: Path) -> Iterator[None]:
     """Hold an exclusive flock on `<capture>.lock` while sizing, rotating and writing.
 
     Sessions (and worktrees, which share the main checkout's capture) each run
@@ -712,7 +712,7 @@ def _break_stale_claim(claim: Path, found: os.stat_result) -> None:
 def _rotation_claim(capture: Path) -> Iterator[bool]:
     """Claim the right to rotate `capture`, yielding whether this caller holds it.
 
-    The flock in `_append_lock` serialises the appenders that hold it. Where flock is unavailable or
+    The flock in `append_lock` serialises the appenders that hold it. Where flock is unavailable or
     refused (full file table, an unopenable sidecar, a network home) an appender runs unlocked, and
     appenders that hold the flock and ones that do not can all be rotating at once, so the claim is taken
     under the flock too. Two racing `.N -> .N+1` shifts overwrite each other's files: whole
@@ -763,7 +763,7 @@ def _release_claim(claim: Path, nonce: str) -> None:
         if mine:
             claim.unlink()
     except OSError:
-        pass
+        pass  # claim already gone or unreadable: nothing of ours to release
 
 
 def append_record(
@@ -785,7 +785,7 @@ def append_record(
     if not capture.parent.exists():
         capture.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     data = line.encode()
-    with _append_lock(capture) if max_bytes > 0 else contextlib.nullcontext():
+    with append_lock(capture) if max_bytes > 0 else contextlib.nullcontext():
         if max_bytes > 0:
             try:
                 size = capture.stat().st_size
@@ -880,8 +880,8 @@ def _report_iterations(
     import agent_iteration_report as iteration_report
     import agent_usage_report as usage_report
 
-    since, _ = usage_report._parse_cli_timestamp(args.since)  # noqa: SLF001
-    until, _ = usage_report._parse_cli_timestamp(args.until)  # noqa: SLF001
+    since, _ = usage_report.parse_cli_timestamp(args.since)
+    until, _ = usage_report.parse_cli_timestamp(args.until)
     loaded, undated = iteration_report.filter_window(
         iteration_report.load_capture(capture, project_filter), since, until
     )
@@ -904,8 +904,8 @@ def _report_subagents(
     import agent_subagent_report as subagent_report
     import agent_usage_report as usage_report
 
-    since, _ = usage_report._parse_cli_timestamp(args.since)  # noqa: SLF001
-    until, _ = usage_report._parse_cli_timestamp(args.until)  # noqa: SLF001
+    since, _ = usage_report.parse_cli_timestamp(args.since)
+    until, _ = usage_report.parse_cli_timestamp(args.until)
     loaded, undated = iteration_report.filter_window(
         iteration_report.load_capture(capture, project_filter), since, until
     )
@@ -1037,8 +1037,8 @@ def _report_prompts(
     import agent_prompt_report as prompt_report
     import agent_usage_report as usage_report
 
-    since = usage_report._parse_cli_timestamp(args.since)[0]  # noqa: SLF001
-    until = usage_report._parse_cli_timestamp(args.until)[0]  # noqa: SLF001
+    since = usage_report.parse_cli_timestamp(args.since)[0]
+    until = usage_report.parse_cli_timestamp(args.until)[0]
     data = prompt_report.read(capture, project_filter)
     result = prompt_report.build(data, since, until)
     limit = args.limit or prompt_report.DEFAULT_LIMIT
@@ -1064,8 +1064,8 @@ def _report_digest(
     import agent_usage_report as usage_report
     import capture_exclude
 
-    since, _ = usage_report._parse_cli_timestamp(args.since)  # noqa: SLF001
-    until, _ = usage_report._parse_cli_timestamp(args.until)  # noqa: SLF001
+    since, _ = usage_report.parse_cli_timestamp(args.since)
+    until, _ = usage_report.parse_cli_timestamp(args.until)
     days = args.days
     if days is None and since is None and until is None and not args.last_session:
         days = digest_report.DEFAULT_DAYS
@@ -1084,7 +1084,7 @@ def _report_digest(
         print(text, end="")
         return 0
     out = Path(args.out) if args.out else digest_report.default_out(capture)
-    shown = usage_report._display_path(out)  # noqa: SLF001
+    shown = usage_report.display_path(out)
     try:
         digest_report.write_digest(out, text, protect=[capture])
     except digest_report.RefusedTargetError as refusal:
@@ -1113,8 +1113,8 @@ def _report_tickets(
     import agent_ticket_report as ticket_report
     import agent_usage_report as usage_report
 
-    since, _ = usage_report._parse_cli_timestamp(args.since)  # noqa: SLF001
-    until, _ = usage_report._parse_cli_timestamp(args.until)  # noqa: SLF001
+    since, _ = usage_report.parse_cli_timestamp(args.since)
+    until, _ = usage_report.parse_cli_timestamp(args.until)
     board = ticket_report.read_board(Path(args.board)) if args.board else None
     if args.board and not (Path(args.board) / "tasks").is_dir():
         print("--board: no tasks directory under the given path, so every status is '?'", file=sys.stderr)
@@ -1166,10 +1166,8 @@ def _view_conflict(args: argparse.Namespace) -> str | None:
     return None
 
 
-def _window_error(args: argparse.Namespace) -> str | None:
-    """Why `--since`/`--until` cannot be used, or None."""
-    import agent_usage_report as usage_report
-
+def _option_misuse(args: argparse.Namespace) -> str | None:
+    """Why `--since`/`--until`, `--days`, `--last-session` or `--out` cannot be used with the chosen view, or None."""
     # _cmd_report picks --digest, --tickets, --sessions, --iterations, --subagents in that order, so
     # --sessions hides the window from --iterations and --subagents.
     windowed = (
@@ -1188,12 +1186,16 @@ def _window_error(args: argparse.Namespace) -> str | None:
         return "--last-session cannot be combined with --days, --since or --until"
     if args.days is not None and args.since is not None:
         return "--days and --since both set the start of the window; use one"
-    conflict = _view_conflict(args)
-    if conflict:
-        return conflict
+    return None
+
+
+def _bounds_error(args: argparse.Namespace) -> str | None:
+    """Why `--since`/`--until` are not a valid window, or None."""
+    import agent_usage_report as usage_report
+
     bounds = []
     for flag, raw in (("--since", args.since), ("--until", args.until)):
-        parsed, invalid = usage_report._parse_cli_timestamp(raw)  # noqa: SLF001
+        parsed, invalid = usage_report.parse_cli_timestamp(raw)
         if invalid:
             return f"{flag} is not a valid ISO-8601 timestamp: {raw!r}"
         bounds.append(parsed)
@@ -1202,82 +1204,57 @@ def _window_error(args: argparse.Namespace) -> str | None:
     return None
 
 
-def _cmd_report(args: argparse.Namespace) -> int:
+def _window_error(args: argparse.Namespace) -> str | None:
+    """Why `--since`/`--until` cannot be used, or None."""
+    return _option_misuse(args) or _view_conflict(args) or _bounds_error(args)
+
+
+def _usage_error(args: argparse.Namespace) -> str | None:
+    """The first flag misuse, or None."""
     if args.board and not args.tickets:
-        print("--board only applies to --tickets", file=sys.stderr)
-        return 2
+        return "--board only applies to --tickets"
     if args.json and (args.digest or args.tickets or args.sessions or not (args.friction or args.prompts)):
-        print("--json only applies to --friction and --prompts", file=sys.stderr)  # not to a view that overrides them
-        return 2
-    window_error = _window_error(args)
-    if window_error:
-        print(window_error, file=sys.stderr)
-        return 2
-    project_filter = None
-    project_dir = Path(args.project_dir) if args.project_dir else None
+        return "--json only applies to --friction and --prompts"  # not to a view that overrides them
+    return _window_error(args)
+
+
+def _project_label(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """The project label to filter by (None: read every project) and the error that stops the run, if any."""
     project = args.project
-    if not project and not args.all_projects:
-        project = project_label_from_settings(Path.cwd())
-        rejected = rejected_label_from_settings(Path.cwd()) if not project else None
-        if rejected is not None:
-            rejected_dir, rejected_label = rejected
-            print(
-                f"project label {rejected_label!r} in {rejected_dir / '.claude' / 'settings.json'} is not allowed: use 1-64 letters, "
-                "digits, '.', '_' or '-' (percent-encoding is decoded first). Fix OTEL_RESOURCE_ATTRIBUTES "
-                "or pass --project <name>.",
-                file=sys.stderr,
-            )
-            return 2
-        if not project and not args.all_projects_if_unlabelled:
-            print(f"no project label found for {Path.cwd()}. {SETTINGS_FIX}", file=sys.stderr)
-            return 2
-    capture = Path(args.source) if args.source is not None else default_plugin_capture()  # the lookup runs only here
-    if capture.is_dir():  # read as a capture it yields nothing: an empty report with exit 0
-        print(f"{capture} is a directory, not a capture file; pass --source <file>", file=sys.stderr)
-        return 1
-    if not capture.exists() and not rotated_captures(capture):
-        print(f"no capture file at {capture}", file=sys.stderr)
-        print(
-            "The usage-observer plugin writes logs/agent-telemetry.mod.jsonl in the project root during a session. "
-            "Run from the project root, or pass --source <file> (or set CLAUDE_OBSERVER_CAPTURE).",
-            file=sys.stderr,
-        )
-        return 1
+    if project or args.all_projects:
+        return project, None
+    project = project_label_from_settings(Path.cwd())
     if project:
-        project_filter = ProjectFilter(project, project_dir)
-        # The views read transcripts from the same project root as the filter; None
-        # means no root owns the label, so they read no transcripts at all.
-        project_dir = project_filter.project_dir
-    else:
-        print(ALL_PROJECTS_WARNING, file=sys.stderr if args.json else sys.stdout)
-    if args.digest:
-        return _report_digest(args, capture, project_filter)
-    if args.tickets:
-        return _report_tickets(args, capture, project_filter, project_dir)
-    if args.sessions:
-        return _report_sessions(args, capture, project_filter)
-    if args.prompts:
-        return _report_prompts(args, capture, project_filter)
-    if args.iterations:
-        return _report_iterations(args, capture, project_filter, project_dir)
-    if args.subagents:
-        return _report_subagents(args, capture, project_filter, project_dir)
-    if args.reasoning:
-        return _report_reasoning(args, capture, project_filter, project_dir)
-    if args.context:
-        return _report_context(args, capture, project_filter)
-    if args.models:
-        return _report_models(args, capture, project_filter)
-    if args.fixed_context:
-        return _report_fixed_context(args, capture, project_filter)
-    if args.skills:  # takes precedence over --tools / --failures
-        return _report_skills(args, capture, project_filter, project_dir)
-    if args.plugins:
-        return _report_plugins(capture, project_filter, project_dir)
-    if args.friction:
-        return _report_friction(args, capture, project_filter, project_dir)
-    if args.tools or args.failures or args.by_session:
-        return _report_tools(args, capture, project_filter, project_dir)
+        return project, None
+    rejected = rejected_label_from_settings(Path.cwd())
+    if rejected is not None:
+        rejected_dir, rejected_label = rejected
+        return None, (
+            f"project label {rejected_label!r} in {rejected_dir / '.claude' / 'settings.json'} is not allowed: use 1-64 letters, "
+            "digits, '.', '_' or '-' (percent-encoding is decoded first). Fix OTEL_RESOURCE_ATTRIBUTES "
+            "or pass --project <name>."
+        )
+    if not args.all_projects_if_unlabelled:
+        return None, f"no project label found for {Path.cwd()}. {SETTINGS_FIX}"
+    return None, None
+
+
+def _capture_problem(capture: Path) -> list[str]:
+    """The lines to print when `capture` cannot be read as a capture, else an empty list."""
+    if capture.is_dir():  # read as a capture it yields nothing: an empty report with exit 0
+        return [f"{capture} is a directory, not a capture file; pass --source <file>"]
+    if not capture.exists() and not rotated_captures(capture):
+        return [
+            f"no capture file at {capture}",
+            (
+                "The usage-observer plugin writes logs/agent-telemetry.mod.jsonl in the project root during a session. "
+                "Run from the project root, or pass --source <file> (or set CLAUDE_OBSERVER_CAPTURE)."
+            ),
+        ]
+    return []
+
+
+def _report_totals(capture: Path, project_filter: ProjectFilter | None) -> int:
     totals = aggregate(capture, project_filter)
     from_requests = False
     if not totals:
@@ -1297,21 +1274,68 @@ def _cmd_report(args: argparse.Namespace) -> int:
     return 0
 
 
-def _positive_int(text: str) -> int:
-    try:
-        value = int(text)
-    except ValueError:
-        value = 0
-    if value < 1:
-        raise argparse.ArgumentTypeError(f"must be a positive integer, got {text!r}")
-    return value
+def _report_view(
+    args: argparse.Namespace, capture: Path, project_filter: ProjectFilter | None, project_dir: Path | None
+) -> int:
+    """Print the first view asked for, in the order the flags document; the token table when none was."""
+    views: list[tuple[object, Callable[[], int]]] = [
+        (args.digest, lambda: _report_digest(args, capture, project_filter)),
+        (args.tickets, lambda: _report_tickets(args, capture, project_filter, project_dir)),
+        (args.sessions, lambda: _report_sessions(args, capture, project_filter)),
+        (args.prompts, lambda: _report_prompts(args, capture, project_filter)),
+        (args.iterations, lambda: _report_iterations(args, capture, project_filter, project_dir)),
+        (args.subagents, lambda: _report_subagents(args, capture, project_filter, project_dir)),
+        (args.reasoning, lambda: _report_reasoning(args, capture, project_filter, project_dir)),
+        (args.context, lambda: _report_context(args, capture, project_filter)),
+        (args.models, lambda: _report_models(args, capture, project_filter)),
+        (args.fixed_context, lambda: _report_fixed_context(args, capture, project_filter)),
+        # --skills takes precedence over --tools / --failures
+        (args.skills, lambda: _report_skills(args, capture, project_filter, project_dir)),
+        (args.plugins, lambda: _report_plugins(capture, project_filter, project_dir)),
+        (args.friction, lambda: _report_friction(args, capture, project_filter, project_dir)),
+        (
+            args.tools or args.failures or args.by_session,
+            lambda: _report_tools(args, capture, project_filter, project_dir),
+        ),
+    ]
+    for asked, show in views:
+        if asked:
+            return show()
+    return _report_totals(capture, project_filter)
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    usage_error = _usage_error(args)
+    if usage_error:
+        print(usage_error, file=sys.stderr)
+        return 2
+    project, label_error = _project_label(args)
+    if label_error:
+        print(label_error, file=sys.stderr)
+        return 2
+    capture = Path(args.source) if args.source is not None else default_plugin_capture()  # the lookup runs only here
+    problem = _capture_problem(capture)
+    for line in problem:
+        print(line, file=sys.stderr)
+    if problem:
+        return 1
+    project_filter = None
+    project_dir = Path(args.project_dir) if args.project_dir else None
+    if project:
+        project_filter = ProjectFilter(project, project_dir)
+        # The views read transcripts from the same project root as the filter; None
+        # means no root owns the label, so they read no transcripts at all.
+        project_dir = project_filter.project_dir
+    else:
+        print(ALL_PROJECTS_WARNING, file=sys.stderr if args.json else sys.stdout)
+    return _report_view(args, capture, project_filter, project_dir)
 
 
 MAX_DIGEST_DAYS = 36500
 
 
 def _days_int(text: str) -> int:
-    value = _positive_int(text)
+    value = positive_int(text)
     if value > MAX_DIGEST_DAYS:
         raise argparse.ArgumentTypeError(f"must be at most {MAX_DIGEST_DAYS} days, got {text!r}")
     return value
@@ -1481,7 +1505,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     report.add_argument(
         "--limit",
-        type=_positive_int,
+        type=positive_int,
         help="rows per list: sessions for --by-session and --skills (default 20), "
         "failures per group for --failures (default 5); sessions (default 20) and "
         "runs (default 10) for --iterations; sessions (default 20) and tools per subagent (default 5) for "

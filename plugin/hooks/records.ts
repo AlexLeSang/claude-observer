@@ -22,7 +22,7 @@ export const IDENTITY_ATTRIBUTES: readonly string[] = [
 // tool took and returned. Claude Code adds them when OTEL_LOG_USER_PROMPTS,
 // OTEL_LOG_TOOL_DETAILS or OTEL_LOG_TOOL_CONTENT is set; the mirror drops them
 // whatever the environment says, so only names, sizes and counts reach the capture.
-export const CONTENT_ATTRIBUTES: readonly string[] = [
+const CONTENT_ATTRIBUTES: readonly string[] = [
   'prompt',
   'prompt_text',
   'response',
@@ -30,6 +30,7 @@ export const CONTENT_ATTRIBUTES: readonly string[] = [
   'tool_input',
   'tool_output',
   'tool_result_content',
+  'error',
 ]
 
 type Usage = {
@@ -118,7 +119,7 @@ function usableRoot(root: string | undefined): string | null {
 // A Read of a file under <root>/skills/: its path relative to the root, else null. Names only a
 // path of plain characters with no `.`, `..` or empty segment, so nothing outside the plugin's
 // skills directory and nothing a user typed beyond a file name can reach the capture.
-export function pluginFileName(path: unknown, root: string | undefined): string | null {
+function pluginFileName(path: unknown, root: string | undefined): string | null {
   const base = usableRoot(root)
   if (base === null || typeof path !== 'string') return null
   const prefix = `${base}/skills/`
@@ -135,7 +136,7 @@ const RUNNER_AFTER = /^[\s"';&|)]$/
 // A Bash command that runs <root>/scripts/reflect_report.py: the allowed view it names, else null.
 // The first word after the runner, up to ; & | or a newline, that is not an option or the value of
 // --limit or --capture; recorded only when it is one of REPORT_VIEWS. Nothing else of the command.
-export function reportViewName(command: unknown, root: string | undefined): string | null {
+function reportViewName(command: unknown, root: string | undefined): string | null {
   const base = usableRoot(root)
   if (base === null || typeof command !== 'string') return null
   const runner = `${base}/scripts/reflect_report.py`
@@ -144,9 +145,9 @@ export function reportViewName(command: unknown, root: string | undefined): stri
     const at = command.indexOf(runner, from)
     if (at < 0) return null
     from = at + 1
-    const before = at === 0 ? ' ' : command[at - 1]
+    const before = at === 0 ? ' ' : command.charAt(at - 1)
     const end = at + runner.length
-    const after = end === command.length ? ' ' : command[end]
+    const after = end === command.length ? ' ' : command.charAt(end)
     // The runner as a whole word: not the tail of a longer path, not the head of a longer name.
     if (!RUNNER_BEFORE.test(before) || !RUNNER_AFTER.test(after)) continue
     const quoted = (before === '"' || before === "'") && after === before
@@ -154,8 +155,9 @@ export function reportViewName(command: unknown, root: string | undefined): stri
     const stop = rest.search(/[;&|\n\r]/)
     const words = (stop < 0 ? rest : rest.slice(0, stop)).split(/\s+/).filter(w => w !== '')
     for (let i = 0; i < words.length; i++) {
-      if (VALUE_OPTIONS.includes(words[i])) i++
-      else if (!words[i].startsWith('-')) return REPORT_VIEWS.includes(words[i]) ? words[i] : null
+      const word = words[i] ?? ''
+      if (VALUE_OPTIONS.includes(word)) i++
+      else if (!word.startsWith('-')) return REPORT_VIEWS.includes(word) ? word : null
     }
     return null
   }
@@ -214,10 +216,13 @@ export function otelRecord(e: TelemetryRecordEntry, identity: readonly string[])
   return { v: 1, source: 'mod', kind: 'otel', ts: e.loggedAt, event: e.event, attributes }
 }
 
+// The summarizer's own usage as the engine hands it up: the four counters, no model name.
+type CompactUsage = Omit<Usage, 'model'>
+
 type CompactResult = {
   tokensBefore?: number
   tokensAfter?: number
-  usage?: Usage
+  usage?: CompactUsage
   skip?: string
 }
 
@@ -348,18 +353,20 @@ const TICKET_RE = /^\s*kanban\s+#([0-9]+)(?![\p{L}\p{N}_])/iu
 // The integer ticket id a dispatch description starts with (`kanban #<id>`), else null. The
 // description is never kept: no text, path or name leaves this function, only an integer of at
 // most five digits that is not 0. Reads a bounded part (MAX_SCAN_CHARS), whatever the size.
-export function dispatchTicket(description: unknown): number | null {
+function dispatchTicket(description: unknown): number | null {
   if (typeof description !== 'string') return null
   const head = description.slice(0, 64)
   const match = TICKET_RE.exec(head)
-  if (!match || match[1].length > MAX_TICKET_DIGITS) return null
+  const digits = match?.[1]
+  if (!match || digits === undefined || digits.length > MAX_TICKET_DIGITS) return null
   // A digit run cut by the prefix limit is no id.
   if (head.length < description.length && match[0].length === head.length) return null
-  const id = Number(match[1])
+  const id = Number(digits)
   // A later reference to another ticket (`#N`) names no one ticket, like the
   // report's rule, and may sit past the prefix. The same id repeated is still that ticket.
   for (const other of description.slice(match[0].length, MAX_SCAN_CHARS).matchAll(/#([0-9]+)/g)) {
-    if (other[1].length > MAX_TICKET_DIGITS || Number(other[1]) !== id) return null
+    const later = other[1] ?? ''
+    if (later.length > MAX_TICKET_DIGITS || Number(later) !== id) return null
   }
   return id > 0 ? id : null
 }
@@ -370,7 +377,7 @@ export function dispatchTicket(description: unknown): number | null {
 // empty. Unassigned code points (Cn) stay, so this and `scripts/safe_name.py` cannot disagree across Unicode
 // versions. The same rule runs when a report reads a name, because older captures hold names as written, and
 // both look at the first 4 * MAX_TYPE_CHARS code points only.
-export function cleanName(name: unknown): string | null {
+function cleanName(name: unknown): string | null {
   if (typeof name !== 'string') return null
   let window = ''
   let seen = 0
@@ -498,7 +505,7 @@ export function pluginSetRecord(settings: Readonly<Record<string, unknown>>) {
   return { enabled: ids.sort() }
 }
 
-export type HookRunTally = { runs: number; ms: number; maxMs: number }
+type HookRunTally = { runs: number; ms: number; maxMs: number }
 
 // Ids a listing did not name, with when it was asked: an id is not listed again for
 // `windowMs`, so five events of a workflow agent cost one list. `now` is injected for tests; a clock

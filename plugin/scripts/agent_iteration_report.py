@@ -44,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agent_tool_report as tr
 import transcript_iterator as ti
+from agent_context_fill import agent_of, text_of
 from agent_usage_report import UNATTRIBUTED, parse_timestamp, ticket_of_dispatch
 from safe_name import clean_name, subagent_label
 
@@ -90,7 +91,7 @@ PROMPT_HOOK_LABEL = "prompt hook (unattributed)"
 YOU_SHOULD_KNOW_NAMES = frozenset({"you-should-know", "cc-plugin-you-should-know"})
 PLUGIN_SET = "plugin_set"
 PLUGIN_REGISTER = "plugin_register"
-# A side-request key for a hook_prompt label: NUL cannot survive `_text`, so no capture field forges it.
+# A side-request key for a hook_prompt label: NUL cannot survive `text_of`, so no capture field forges it.
 HOOK_KEY = HOOK_PROMPT + "\0"
 HOOK_PROMPT_NOTE = (
     f"  query_source={HOOK_PROMPT}: '{YOU_SHOULD_KNOW_LABEL}' = the session's plugin_set names the plugin that forks "
@@ -163,15 +164,6 @@ def hook_prompt_label(session: str, you_should_know: set[str]) -> str:
     return YOU_SHOULD_KNOW_LABEL if session in you_should_know else PROMPT_HOOK_LABEL
 
 
-def _text(value: object, default: str = "?") -> str:
-    """`value` as a label: each non-printable character becomes `?`, so no capture field can break a table row
-    or send a terminal escape (the same rule as `agent_context_fill.text_of`)."""
-    if value is None:
-        return default
-    text = tr.encodable(str(value))
-    return text if text.isprintable() else "".join(c if c.isprintable() else "?" for c in text)
-
-
 def subagent_type(value: object, default: str) -> str:
     """The label of a subagent: see `safe_name.subagent_label`."""
     return subagent_label(value, default)
@@ -188,48 +180,48 @@ def loop_type(source: str, agent_name: object) -> str | None:
 def _native_step(record: dict[str, Any]) -> Request:
     usage = record.get("usage")
     usage = usage if isinstance(usage, dict) else {}
-    agent = record.get("agent")
+    agent = agent_of(record.get("agent"))
     return Request(
-        session=_text(record.get("session")),
-        prompt=_text(record.get("prompt")),
-        model=_text(record.get("model")),
+        session=text_of(record.get("session")),
+        prompt=text_of(record.get("prompt")),
+        model=text_of(record.get("model")),
         tokens=tuple(tr.as_number(usage.get(key)) or 0.0 for key in NATIVE_TOKEN_KEYS),
         cost=None,
-        timestamp=_text(record.get("ts"), ""),
+        timestamp=text_of(record.get("ts"), ""),
         source="step",
         agent_type=MAIN if agent is None else subagent_type(record.get("agent_type"), "?"),
-        agent=None if agent is None else _text(agent),
+        agent=agent,
     )
 
 
 def _native_call(record: dict[str, Any], order: int) -> Call:
     denied = record.get("denied") is True
     error = record.get("error") is True
-    agent = record.get("agent")
+    agent = agent_of(record.get("agent"))
     return Call(
-        session=_text(record.get("session")),
-        prompt=_text(record.get("prompt")),
-        agent=None if agent is None else _text(agent),
-        tool=_text(record.get("tool")),
+        session=text_of(record.get("session")),
+        prompt=text_of(record.get("prompt")),
+        agent=agent,
+        tool=text_of(record.get("tool")),
         tool_use_id=tr.as_str(record.get("tool_use_id")),
         success=not (error or denied),
         error_type="denied" if denied else ("error" if error else None),
         input_size=tr.as_number(record.get("input_chars")),
-        timestamp=_text(record.get("ts"), ""),
+        timestamp=text_of(record.get("ts"), ""),
         order=order,
     )
 
 
 def _api_request(attrs: dict[str, Any]) -> Request:
-    source = _text(attrs.get("query_source"), NO_SOURCE)
+    source = text_of(attrs.get("query_source"), NO_SOURCE)
     cost = tr.as_cost(attrs.get("cost_usd"))
     return Request(
-        session=_text(attrs.get("session.id")),
-        prompt=_text(attrs.get("prompt.id")),
-        model=_text(attrs.get("model")),
+        session=text_of(attrs.get("session.id")),
+        prompt=text_of(attrs.get("prompt.id")),
+        model=text_of(attrs.get("model")),
         tokens=tuple(tr.as_number(attrs.get(key)) or 0.0 for key in tr.API_TOKEN_KEYS),
         cost=cost,
-        timestamp=_text(attrs.get("event.timestamp"), ""),
+        timestamp=text_of(attrs.get("event.timestamp"), ""),
         source=source,
         agent_type=loop_type(source, attrs.get("agent.name")),
         request_id=tr.as_str(attrs.get("request_id")),
@@ -239,15 +231,15 @@ def _api_request(attrs: dict[str, Any]) -> Request:
 
 def _tool_result(attrs: dict[str, Any], order: int) -> Call:
     return Call(
-        session=_text(attrs.get("session.id")),
-        prompt=_text(attrs.get("prompt.id")),
+        session=text_of(attrs.get("session.id")),
+        prompt=text_of(attrs.get("prompt.id")),
         agent=None,
-        tool=_text(attrs.get("tool_name")),
+        tool=text_of(attrs.get("tool_name")),
         tool_use_id=tr.as_str(attrs.get("tool_use_id")),
         success=str(attrs.get("success")).lower() == "true",
         error_type=tr.as_str(attrs.get("error_type")),
         input_size=tr.as_number(attrs.get("tool_input_size_bytes")),
-        timestamp=_text(attrs.get("event.timestamp"), ""),
+        timestamp=text_of(attrs.get("event.timestamp"), ""),
         order=order,
     )
 
@@ -271,6 +263,58 @@ def _note_request_source(capture: Capture, agent_type: str | None, request: Requ
         _note_source(capture, agent_type, parts[1])
 
 
+def _load_plugin_record(out: Capture, record: dict[str, Any], project_filter: ProjectFilter | None) -> None:
+    session = record.get("session")
+    if (
+        isinstance(session, str)
+        and names_you_should_know(record)
+        and (project_filter is None or project_filter.keep({"session.id": session}))
+    ):
+        out.you_should_know.add(text_of(session))
+
+
+def _load_api_request(out: Capture, attrs: dict[str, Any]) -> None:
+    request = _api_request(attrs)
+    parts = request.source.split(":")
+    if parts[0] == AGENT_SOURCE_PREFIX.rstrip(":") and len(parts) >= 3:
+        _note_source(out, request.agent_type, parts[1])
+    elif request.source == "agent:custom":  # type unknown unless a transcript joins
+        _note_source(out, request.agent_type, "custom")
+    out.requests.append(request)
+
+
+def _load_native(
+    out: Capture, record: dict[str, Any], kind: str, order: int, project_filter: ProjectFilter | None
+) -> int:
+    """Add a native `step`/`tool` record unless the filter drops its session; the new record order."""
+    if project_filter is not None and not project_filter.keep({"session.id": record.get("session")}):
+        return order
+    order += 1
+    if kind == "step":
+        out.steps.append(_native_step(record))
+    else:
+        out.native_calls.append(_native_call(record, order))
+    return order
+
+
+def _load_events(out: Capture, record: dict[str, Any], order: int, project_filter: ProjectFilter | None) -> int:
+    """Add the OTLP events of one record that pass the filter; the new record order."""
+    for name, attrs in tr.iter_log_events(record.get("payload")):
+        if name not in (tr.API_REQUEST, tr.TOOL_RESULT, SUBAGENT_COMPLETED):
+            continue
+        if project_filter is not None and not project_filter.keep(attrs):
+            continue
+        if name == SUBAGENT_COMPLETED:
+            _note_source(out, clean_name(attrs.get("agent_type")), clean_name(attrs.get("agent.source")))
+            continue
+        order += 1
+        if name == tr.API_REQUEST:
+            _load_api_request(out, attrs)
+        else:
+            out.otel_calls.append(_tool_result(attrs, order))
+    return order
+
+
 def load_capture(capture: Path, project_filter: ProjectFilter | None = None) -> Capture:
     """Native `step`/`tool` records and `api_request`/`tool_result` events that
     pass `project_filter`; native records are filtered by their session."""
@@ -279,42 +323,11 @@ def load_capture(capture: Path, project_filter: ProjectFilter | None = None) -> 
     for record in tr.capture_records(capture):
         kind = record.get("kind")
         if kind in (PLUGIN_SET, PLUGIN_REGISTER):
-            session = record.get("session")
-            if (
-                isinstance(session, str)
-                and names_you_should_know(record)
-                and (project_filter is None or project_filter.keep({"session.id": session}))
-            ):
-                out.you_should_know.add(_text(session))
-            continue
-        if kind in ("step", "tool"):
-            if project_filter is not None and not project_filter.keep({"session.id": record.get("session")}):
-                continue
-            order += 1
-            if kind == "step":
-                out.steps.append(_native_step(record))
-            else:
-                out.native_calls.append(_native_call(record, order))
-            continue
-        for name, attrs in tr.iter_log_events(record.get("payload")):
-            if name not in (tr.API_REQUEST, tr.TOOL_RESULT, SUBAGENT_COMPLETED):
-                continue
-            if project_filter is not None and not project_filter.keep(attrs):
-                continue
-            if name == SUBAGENT_COMPLETED:
-                _note_source(out, clean_name(attrs.get("agent_type")), clean_name(attrs.get("agent.source")))
-                continue
-            order += 1
-            if name == tr.API_REQUEST:
-                request = _api_request(attrs)
-                parts = request.source.split(":")
-                if parts[0] == AGENT_SOURCE_PREFIX.rstrip(":") and len(parts) >= 3:
-                    _note_source(out, request.agent_type, parts[1])
-                elif request.source == "agent:custom":  # type unknown unless a transcript joins
-                    _note_source(out, request.agent_type, "custom")
-                out.requests.append(request)
-            else:
-                out.otel_calls.append(_tool_result(attrs, order))
+            _load_plugin_record(out, record, project_filter)
+        elif kind in ("step", "tool"):
+            order = _load_native(out, record, kind, order, project_filter)
+        else:
+            order = _load_events(out, record, order, project_filter)
     return out
 
 
@@ -409,6 +422,34 @@ def _digest(tool_input: object) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _index_subagent(index: TranscriptIndex, context: ti.TranscriptContext) -> str:
+    """Record a subagent transcript's request ids, ticket label and type; its agent id."""
+    agent_id = context.transcript_path.stem.removeprefix("agent-")
+    ticket = ticket_of_dispatch(context)
+    if ticket != UNATTRIBUTED:
+        index.ticket_of_agent[agent_id] = f"#{ticket}"
+    agent_type = context.agent_type  # `discover_transcripts` cleaned it
+    if agent_type:
+        index.type_of_agent[agent_id] = subagent_type(agent_type, "?")
+    for record in ti.read_jsonl(context.transcript_path, context.root):
+        request_id = record.get("requestId")
+        if record.get("type") == "assistant" and isinstance(request_id, str):
+            index.agent_of_request[request_id] = agent_id
+    return agent_id
+
+
+def _index_tool_uses(
+    index: TranscriptIndex, context: ti.TranscriptContext, agent_id: str | None, digest_inputs: bool
+) -> None:
+    for event in ti.iter_events(context):
+        if not isinstance(event, ti.ToolUseEvent):
+            continue
+        if agent_id is not None:
+            index.agent_of_use[event.tool_use_id] = agent_id
+        if digest_inputs:
+            index.input_of_use[event.tool_use_id] = _digest(event.tool_input)
+
+
 def read_transcripts(dirs: Iterable[Path], subagent_sessions: set[str], failure_sessions: set[str]) -> TranscriptIndex:
     """Subagent transcripts of `subagent_sessions` (request and tool-use ids,
     ticket labels) and every transcript of `failure_sessions` (input digests)."""
@@ -420,26 +461,10 @@ def read_transcripts(dirs: Iterable[Path], subagent_sessions: set[str], failure_
             if context.kind == "subagent":
                 if session not in subagent_sessions and session not in failure_sessions:
                     continue
-                agent_id = context.transcript_path.stem.removeprefix("agent-")
-                ticket = ticket_of_dispatch(context)
-                if ticket != UNATTRIBUTED:
-                    index.ticket_of_agent[agent_id] = f"#{ticket}"
-                agent_type = context.agent_type  # `discover_transcripts` cleaned it
-                if agent_type:
-                    index.type_of_agent[agent_id] = subagent_type(agent_type, "?")
-                for record in ti.read_jsonl(context.transcript_path):
-                    request_id = record.get("requestId")
-                    if record.get("type") == "assistant" and isinstance(request_id, str):
-                        index.agent_of_request[request_id] = agent_id
+                agent_id = _index_subagent(index, context)
             elif session not in failure_sessions:
                 continue
-            for event in ti.iter_events(context):
-                if not isinstance(event, ti.ToolUseEvent):
-                    continue
-                if agent_id is not None:
-                    index.agent_of_use[event.tool_use_id] = agent_id
-                if session in failure_sessions:
-                    index.input_of_use[event.tool_use_id] = _digest(event.tool_input)
+            _index_tool_uses(index, context, agent_id, session in failure_sessions)
     return index
 
 
@@ -574,10 +599,23 @@ def _flag(runs: list[Run]) -> None:
         )
 
 
-def build_report(capture: Capture, project_dir: Path | None) -> IterationReport:
-    native_prompts = {(step.session, step.prompt) for step in capture.steps}
+class _Runs:
+    """The runs of a report, keyed by who ran: created on first use, in first-use order."""
+
+    def __init__(self) -> None:
+        self.by_key: dict[tuple[str, ...], Run] = {}
+
+    def run_for(self, key: tuple[str, ...], request: Request, agent_id: str, agent_type: str | None = None) -> Run:
+        if key not in self.by_key:
+            self.by_key[key] = Run(request.session, request.prompt, str(agent_type or request.agent_type), agent_id)
+        return self.by_key[key]
+
+
+def _split_requests(
+    capture: Capture, native_prompts: set[tuple[str, str]]
+) -> tuple[dict[str, SideStats], list[Request]]:
+    """Side requests summed by source, and the loop requests no native step mirrors."""
     side: dict[str, SideStats] = defaultdict(SideStats)
-    pairs = _pair_steps(capture)
     otel_loop: list[Request] = []
     for request in capture.requests:
         if request.agent_type is None:
@@ -590,6 +628,87 @@ def build_report(capture: Capture, project_dir: Path | None) -> IterationReport:
             stats.cost += request.cost or 0.0
         elif (request.session, request.prompt) not in native_prompts:
             otel_loop.append(request)  # else mirrored by a native step: counted through that step
+    return side, otel_loop
+
+
+def _add_native_steps(runs: _Runs, capture: Capture, pairs: dict[int, Request]) -> None:
+    for step in capture.steps:
+        match = pairs.get(id(step))
+        if match is not None:
+            step.cost, step.skill = match.cost, match.skill
+        if step.agent is None:
+            runs.run_for((MAIN, step.session, step.prompt), step, NO_AGENT_ID).add_request(step)
+        else:
+            runs.run_for(("agent", step.session, step.agent), step, step.agent).add_request(step)
+
+
+def _add_otel_requests(
+    runs: _Runs, capture: Capture, otel_loop: list[Request], index: TranscriptIndex
+) -> tuple[int, set[tuple[str, str]]]:
+    """Add the loop requests to their runs; how many found no transcript, and the prompts they belong to."""
+    unmatched = 0
+    unknown_prompts: set[tuple[str, str]] = set()
+    for request in otel_loop:
+        if request.agent_type == MAIN:
+            runs.run_for((MAIN, request.session, request.prompt), request, NO_AGENT_ID).add_request(request)
+            continue
+        agent_id = index.agent_of_request.get(request.request_id or "")
+        if agent_id is not None:
+            transcript_type = index.type_of_agent.get(agent_id) if _untyped_source(request) else None
+            _note_request_source(capture, transcript_type, request)
+            runs.run_for(("agent", request.session, agent_id), request, agent_id, transcript_type).add_request(request)
+            continue
+        unmatched += 1
+        unknown_prompts.add((request.session, request.prompt))
+        key: tuple[str, ...] = (UNKNOWN_AGENT_ID, request.session, request.prompt, str(request.agent_type))
+        runs.run_for(key, request, UNKNOWN_AGENT_ID).add_request(request)
+    return unmatched, unknown_prompts
+
+
+def _otel_call_key(call: Call, index: TranscriptIndex, unknown_prompts: set[tuple[str, str]]) -> tuple[str, ...]:
+    agent_id = index.agent_of_use.get(call.tool_use_id or "")
+    if agent_id is not None:
+        return ("agent", call.session, agent_id)
+    if (call.session, call.prompt) in unknown_prompts:
+        return ()
+    return (MAIN, call.session, call.prompt)
+
+
+def _attach_calls(
+    runs: _Runs,
+    capture: Capture,
+    otel_calls: list[Call],
+    index: TranscriptIndex,
+    unknown_prompts: set[tuple[str, str]],
+) -> int:
+    """Attach every tool call to its run; how many belong to none."""
+    unattributed = 0
+    keyed: list[tuple[Call, tuple[str, ...]]] = [
+        (call, (MAIN, call.session, call.prompt) if call.agent is None else ("agent", call.session, call.agent))
+        for call in capture.native_calls
+    ]
+    keyed += [(call, _otel_call_key(call, index, unknown_prompts)) for call in otel_calls]
+    for call, key in keyed:
+        if key in runs.by_key:
+            runs.by_key[key].add_call(call)
+        else:
+            unattributed += 1
+    return unattributed
+
+
+def _assign_tasks(run_list: list[Run], index: TranscriptIndex) -> None:
+    for run in run_list:
+        ticket = index.ticket_of_agent.get(run.agent_id) if run.agent_type != MAIN else None
+        if ticket is not None:
+            run.task = ticket
+        elif run.skills:
+            run.task = run.skills.most_common(1)[0][0]
+
+
+def build_report(capture: Capture, project_dir: Path | None) -> IterationReport:
+    native_prompts = {(step.session, step.prompt) for step in capture.steps}
+    pairs = _pair_steps(capture)
+    side, otel_loop = _split_requests(capture, native_prompts)
     otel_calls = [c for c in capture.otel_calls if (c.session, c.prompt) not in native_prompts]
 
     subagent_sessions = {r.session for r in otel_loop if r.agent_type != MAIN}
@@ -597,66 +716,13 @@ def build_report(capture: Capture, project_dir: Path | None) -> IterationReport:
     failure_sessions = {c.session for c in [*capture.native_calls, *otel_calls] if not c.success}
     index = read_transcripts(tr.transcript_dirs(project_dir), subagent_sessions, failure_sessions)
 
-    runs: dict[tuple[str, ...], Run] = {}
+    runs = _Runs()
+    _add_native_steps(runs, capture, pairs)
+    unmatched, unknown_prompts = _add_otel_requests(runs, capture, otel_loop, index)
+    unattributed = _attach_calls(runs, capture, otel_calls, index, unknown_prompts)
 
-    def run_for(key: tuple[str, ...], request: Request, agent_id: str, agent_type: str | None = None) -> Run:
-        if key not in runs:
-            runs[key] = Run(request.session, request.prompt, str(agent_type or request.agent_type), agent_id)
-        return runs[key]
-
-    for step in capture.steps:
-        match = pairs.get(id(step))
-        if match is not None:
-            step.cost, step.skill = match.cost, match.skill
-        if step.agent is None:
-            run_for((MAIN, step.session, step.prompt), step, NO_AGENT_ID).add_request(step)
-        else:
-            run_for(("agent", step.session, step.agent), step, step.agent).add_request(step)
-
-    unmatched = 0
-    unknown_prompts: set[tuple[str, str]] = set()
-    for request in otel_loop:
-        if request.agent_type == MAIN:
-            run_for((MAIN, request.session, request.prompt), request, NO_AGENT_ID).add_request(request)
-            continue
-        agent_id = index.agent_of_request.get(request.request_id or "")
-        if agent_id is not None:
-            transcript_type = index.type_of_agent.get(agent_id) if _untyped_source(request) else None
-            _note_request_source(capture, transcript_type, request)
-            run_for(("agent", request.session, agent_id), request, agent_id, transcript_type).add_request(request)
-            continue
-        unmatched += 1
-        unknown_prompts.add((request.session, request.prompt))
-        key: tuple[str, ...] = (UNKNOWN_AGENT_ID, request.session, request.prompt, str(request.agent_type))
-        run_for(key, request, UNKNOWN_AGENT_ID).add_request(request)
-
-    unattributed = 0
-    for call in capture.native_calls:
-        key = (MAIN, call.session, call.prompt) if call.agent is None else ("agent", call.session, call.agent)
-        if key in runs:
-            runs[key].add_call(call)
-        else:
-            unattributed += 1
-    for call in otel_calls:
-        agent_id = index.agent_of_use.get(call.tool_use_id or "")
-        if agent_id is not None:
-            key = ("agent", call.session, agent_id)
-        elif (call.session, call.prompt) in unknown_prompts:
-            key = ()
-        else:
-            key = (MAIN, call.session, call.prompt)
-        if key in runs:
-            runs[key].add_call(call)
-        else:
-            unattributed += 1
-
-    run_list = list(runs.values())
-    for run in run_list:
-        ticket = index.ticket_of_agent.get(run.agent_id) if run.agent_type != MAIN else None
-        if ticket is not None:
-            run.task = ticket
-        elif run.skills:
-            run.task = run.skills.most_common(1)[0][0]
+    run_list = list(runs.by_key.values())
+    _assign_tasks(run_list, index)
     _flag(run_list)
     repeats = [repeat for run in run_list for repeat in _repeats(run, index)]
     iterations = sum(run.iterations for run in run_list)

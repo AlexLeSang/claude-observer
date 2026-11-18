@@ -112,11 +112,11 @@ def make_private_dir(home: Path, prefix: str) -> Path:
     try:
         info = os.lstat(path)
         if not stat.S_ISDIR(info.st_mode):
-            raise ExcerptRefused("fail", "the temporary directory is not a directory")  # noqa: TRY301
+            raise ExcerptRefused("fail", "the temporary directory is not a directory")  # noqa: TRY301 - the except below cleans up and re-raises
         if os.name == "posix" and (stat.S_IMODE(info.st_mode) != 0o700 or info.st_uid != os.getuid()):
-            raise ExcerptRefused("fail", "the temporary directory is not private (mode 0700, ours)")  # noqa: TRY301
+            raise ExcerptRefused("fail", "the temporary directory is not private (mode 0700, ours)")  # noqa: TRY301 - the except below cleans up and re-raises
         if _inside(os.path.realpath(path), os.path.realpath(home)):
-            raise ExcerptRefused("fail", "the temporary directory is inside the project: set TMPDIR elsewhere")  # noqa: TRY301
+            raise ExcerptRefused("fail", "the temporary directory is inside the project: set TMPDIR elsewhere")  # noqa: TRY301 - the except below cleans up and re-raises
     except BaseException:
         shutil.rmtree(path, ignore_errors=True)
         raise
@@ -146,7 +146,7 @@ def sweep_stale(now: float | None = None) -> int:
             shutil.rmtree(entry.path)  # refuses a link at the top; never follows one inside
             removed += 1
         except OSError:
-            continue
+            continue  # entry vanished or is not ours to remove: leave it, count only removals
     return removed
 
 
@@ -159,7 +159,7 @@ def open_work_dir(path: Path) -> int:
     try:
         info = os.fstat(fd)
         if not stat.S_ISDIR(info.st_mode) or (os.name == "posix" and info.st_uid != os.getuid()):
-            raise ExcerptRefused("fail", "the temporary directory is not ours")  # noqa: TRY301
+            raise ExcerptRefused("fail", "the temporary directory is not ours")  # noqa: TRY301 - the except below cleans up and re-raises
     except BaseException:
         os.close(fd)
         raise
@@ -184,7 +184,7 @@ def _remove_work(path: Path, fd: int) -> bool:
         for name in os.listdir(fd):
             try:
                 os.unlink(name, dir_fd=fd)
-            except OSError:  # noqa: PERF203
+            except OSError:  # noqa: PERF203 - one failed unlink must not stop the others
                 ok = False
     except OSError:
         return False
@@ -446,6 +446,62 @@ def _report_left(done: bool, out_dir: Path | None) -> None:
         raise ExcerptRefused("fail", note)
 
 
+@dataclass
+class _Run:
+    """What one `build_excerpt` call has made so far: the work directory (with its descriptor), the excerpt's own
+    directory, and whether the excerpt was written."""
+
+    work: Path | None = None
+    work_fd: int | None = None
+    out_dir: Path | None = None
+    done: bool = False
+
+    def guard(self) -> None:
+        if self.work is None or self.work_fd is None or not same_dir(self.work, self.work_fd):
+            raise ExcerptRefused("fail", "the work directory was replaced while the doctor ran, so no excerpt")
+
+
+def _scrub_copy(run: _Run, copy: Path) -> Any:
+    """Scrub the copy in place; the scrub's result, or a refusal."""
+    try:
+        (result,) = sc.scrub_files([copy])
+    except Exception as error:  # any scrub failure: no excerpt, the type name only
+        raise ExcerptRefused("fail", f"the scrub of the copy failed ({type(error).__name__})") from None
+    run.guard()
+    if result.unscrubbed:
+        raise ExcerptRefused("fail", f"the scrub left {result.unscrubbed} lines unscrubbed, so no excerpt")
+    return result
+
+
+def _project_copy(copy: Path, lines: int) -> ep.Projection:
+    try:
+        return ep.project_lines(_read_copy(copy), min(max(lines, 1), ep.MAX_KEEP))
+    except ep.ProjectionRefused:  # the net: a key or a string outside the allowlist, so no excerpt at all
+        raise ExcerptRefused("fail", "the projection's own check refused a record, so no excerpt") from None
+
+
+def _destination(run: _Run, home: Path, out: Path | None) -> Path:
+    if out is None:
+        run.out_dir = make_private_dir(home, OUT_PREFIX)
+        return run.out_dir / EXCERPT_NAME
+    return Path(os.path.abspath(out))  # noqa: PTH100 - abspath, unlike resolve, does not follow a link
+
+
+def _clean_up(run: _Run, keep: bool) -> None:
+    """The `finally` of `build_excerpt`: remove what the run made (a kept work directory stays after a success)."""
+    if not run.done:
+        _remove_tree(run.out_dir)
+    left = False
+    if run.work_fd is not None and run.work is not None:
+        if not (run.done and keep):
+            left = not _remove_work(run.work, run.work_fd)
+        os.close(run.work_fd)
+    elif not (run.done and keep):
+        left = not _remove_tree(run.work)
+    if left:
+        _report_left(run.done, run.out_dir)
+
+
 def build_excerpt(
     capture: Path,
     home: Path,
@@ -459,47 +515,30 @@ def build_excerpt(
 ) -> Built:
     """Build the excerpt or raise `ExcerptRefused`. `content_check(copy)` returns an object with `.level` and
     `.text` (`doctor_checks.check_content`); `checks` are (label, level, text) lines for the file."""
-    if out is not None and not Path(os.path.abspath(out)).parent.is_dir():  # noqa: PTH100
+    if out is not None and not Path(os.path.abspath(out)).parent.is_dir():  # noqa: PTH100 - abspath, unlike resolve, does not follow a link
         raise ExcerptRefused("fail", "the directory of the output file does not exist")
     sweep_stale()
-    work: Path | None = None
-    work_fd: int | None = None
-    out_dir: Path | None = None
-    done = False
-
-    def guard() -> None:
-        if work is None or work_fd is None or not same_dir(work, work_fd):
-            raise ExcerptRefused("fail", "the work directory was replaced while the doctor ran, so no excerpt")
-
+    run = _Run()
     with _exit_on_signals():
         try:
-            work = make_private_dir(home, WORK_PREFIX)
-            work_fd = open_work_dir(work)
-            copy = work / COPY_NAME
+            run.work = make_private_dir(home, WORK_PREFIX)
+            run.work_fd = open_work_dir(run.work)
+            copy = run.work / COPY_NAME
             data = read_tail(capture, on_read)
             copied = data.count(b"\n")
             if copied == 0:
                 raise ExcerptRefused("info", "the capture's tail holds no complete line, so no excerpt")
-            _write_new(work_fd, COPY_NAME, data)
-            guard()
-            try:
-                (result,) = sc.scrub_files([copy])
-            except Exception as error:  # any scrub failure: no excerpt, the type name only
-                raise ExcerptRefused("fail", f"the scrub of the copy failed ({type(error).__name__})") from None
-            guard()
-            if result.unscrubbed:
-                raise ExcerptRefused("fail", f"the scrub left {result.unscrubbed} lines unscrubbed, so no excerpt")
+            _write_new(run.work_fd, COPY_NAME, data)
+            run.guard()
+            result = _scrub_copy(run, copy)
             _check_copy(copy)
             verdict = content_check(copy)
-            guard()
+            run.guard()
             if verdict.level != "ok":
                 raise ExcerptRefused(
                     "fail", f"the content check of the scrubbed copy was not clean ({verdict.level}), so no excerpt"
                 )
-            try:
-                projection = ep.project_lines(_read_copy(copy), min(max(lines, 1), ep.MAX_KEEP))
-            except ep.ProjectionRefused:  # the net: a key or a string outside the allowlist, so no excerpt at all
-                raise ExcerptRefused("fail", "the projection's own check refused a record, so no excerpt") from None
+            projection = _project_copy(copy, lines)
             text = render(
                 projection,
                 sc.describe(COPY_NAME, result),
@@ -508,28 +547,14 @@ def build_excerpt(
                 ".".join(map(str, sys.version_info[:3])),
                 sys.platform,
             )
-            if out is None:
-                out_dir = make_private_dir(home, OUT_PREFIX)
-                dest = out_dir / EXCERPT_NAME
-            else:
-                dest = Path(os.path.abspath(out))  # noqa: PTH100
+            dest = _destination(run, home, out)
             write_excerpt(dest, text)
-            done = True
+            run.done = True
             note = (
                 f"{copied} lines copied, {result.blanked} blanked by the scrub; dropped whole: otel {projection.otel}, "
                 f"unknown kind {projection.unknown_kind}, not objects {projection.unreadable}, "
                 f"oversize {projection.oversize}"
             )
-            return Built(dest, text, work if keep else None, note)
+            return Built(dest, text, run.work if keep else None, note)
         finally:
-            if not done:
-                _remove_tree(out_dir)
-            left = False
-            if work_fd is not None and work is not None:
-                if not (done and keep):
-                    left = not _remove_work(work, work_fd)
-                os.close(work_fd)
-            elif not (done and keep):
-                left = not _remove_tree(work)
-            if left:
-                _report_left(done, out_dir)
+            _clean_up(run, keep)

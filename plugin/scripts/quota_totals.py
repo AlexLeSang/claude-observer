@@ -52,10 +52,15 @@ class Total:
     skipped: int
 
 
-def _is_clean(path: Path) -> bool:
-    """False when the file cannot be read or holds a line that is not a JSON object."""
+def _is_clean(path: Path, root: Path) -> bool:
+    """False when the file cannot be read or holds a line that is not a JSON object. Opened like every transcript
+    read (`ti.open_regular`, under `root`): `_inside` checked the file a moment ago, and a FIFO, a link or a
+    swapped parent directory put there since must not block or be followed."""
+    fd = ti.open_regular(path, root)  # the shared choke point; no second open path in this module
+    if fd is None:
+        return False
     try:
-        with path.open(encoding="utf-8", errors="replace") as fh:
+        with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
             for raw in fh:
                 line = raw.strip()
                 if not line:
@@ -121,62 +126,88 @@ def _has_tokens(usage: Mapping[str, object]) -> bool:
     return sum(usage_tokens(usage, key) for key in keys) > 0
 
 
+_Candidates = list[tuple[ti.TranscriptContext, tuple[ti.AssistantMessageEvent, ...]]]
+
+
+def _read_transcript(
+    context: ti.TranscriptContext, directory: Path
+) -> tuple[tuple[ti.AssistantMessageEvent, ...] | None, bool, int]:
+    """One transcript: its assistant events (None when it is not read), whether it is torn, and files lost."""
+    if not _listable(context.transcript_path.parent):
+        # lists but cannot be entered: `_unreadable_dirs` counted it once already
+        return None, False, 0
+    if not _inside(context.transcript_path, directory):
+        return None, False, 1  # never read through a link, and never open a FIFO
+    torn = not _is_clean(context.transcript_path, directory)
+    try:
+        events = tuple(e for e in ti.iter_events(context) if isinstance(e, ti.AssistantMessageEvent))
+    except Exception:  # nothing from the failure may leave: not its text, not its path
+        return None, torn, 1
+    return events, torn, 0
+
+
+def _read_directory(directory: Path, candidates: _Candidates, flagged: set[int]) -> int:
+    """Read the transcripts of one project directory into `candidates`; returns how many files were lost."""
+    if not directory.exists():
+        return 0  # a missing directory is no data, not a lost one
+    if not _listable(directory):
+        return 1  # the project directory itself is locked; whatever `glob` still names is not read
+    skipped = _unreadable_dirs(directory)
+    try:
+        contexts = ti.discover_transcripts(directory, skip_links=False)
+    except Exception:  # nothing from the failure may leave: not its text, not its path
+        return skipped + 1
+    for context in contexts:
+        events, torn, lost = _read_transcript(context, directory)
+        skipped += lost
+        if events is None:
+            continue
+        if torn:
+            skipped += 1
+            flagged.add(len(candidates))
+        candidates.append((context, events))
+    return skipped
+
+
+def _file_weights(
+    owned: Sequence[ti.AssistantMessageEvent],
+    meta_model: str | None,
+    since: datetime | None,
+    until: datetime | None,
+) -> tuple[list[float], bool]:
+    """The eq weights of one file's messages in the window, and whether the file was not fully usable."""
+    values: list[float] = []
+    unusable = False
+    try:
+        for event in owned:
+            if not _in_window(event, since, until):
+                continue
+            model = event.model or meta_model
+            if not aur.is_priced(model):
+                unusable = unusable or (event.usage is not None and _has_tokens(event.usage))
+                continue
+            weight = aur.eq_weight(event.usage, model)
+            if math.isfinite(weight) and weight >= 0:
+                values.append(weight)
+            else:
+                unusable = True
+    except Exception:  # nothing from the failure may leave: the file weighs nothing and counts once
+        return [], True
+    return values, unusable
+
+
 def _sum_eq(dirs: Sequence[Path], since: datetime | None, until: datetime | None) -> Total:
     """The eq of the transcripts under `dirs`, read as one project (a response repeated in several
-    files counts once). Everything but the two numbers stays inside this function."""
+    files counts once). Everything but the two numbers stays inside this module."""
     skipped = 0
-    candidates: list[tuple[ti.TranscriptContext, tuple[ti.AssistantMessageEvent, ...]]] = []
+    candidates: _Candidates = []
     flagged: set[int] = set()
     for directory in dirs:
-        if not directory.exists():
-            continue  # a missing directory is no data, not a lost one
-        if not _listable(directory):
-            skipped += 1  # the project directory itself is locked; whatever `glob` still names is not read
-            continue
-        skipped += _unreadable_dirs(directory)
-        try:
-            contexts = ti.discover_transcripts(directory, skip_links=False)
-        except Exception:  # nothing from the failure may leave: not its text, not its path
-            skipped += 1
-            continue
-        for context in contexts:
-            if not _listable(context.transcript_path.parent):
-                continue  # a directory that lists but cannot be entered: `_unreadable_dirs` counted it once already
-            if not _inside(context.transcript_path, directory):
-                skipped += 1  # never read through a link, and never open a FIFO
-                continue
-            torn = not _is_clean(context.transcript_path)
-            try:
-                events = tuple(e for e in ti.iter_events(context) if isinstance(e, ti.AssistantMessageEvent))
-            except Exception:  # nothing from the failure may leave: not its text, not its path
-                skipped += 1
-                continue
-            if torn:
-                skipped += 1
-                flagged.add(len(candidates))
-            candidates.append((context, events))
-
+        skipped += _read_directory(directory, candidates, flagged)
     values: list[float] = []
     for index, (context, owned) in enumerate(ti.dedupe_across_files(candidates)):
         meta_model = context.meta_model if isinstance(context.meta_model, str) else None  # a hostile `.meta.json`
-        file_values: list[float] = []
-        unusable = False
-        try:
-            for event in owned:
-                if not _in_window(event, since, until):
-                    continue
-                model = event.model or meta_model
-                if not aur.is_priced(model):
-                    unusable = unusable or (event.usage is not None and _has_tokens(event.usage))
-                    continue
-                weight = aur.eq_weight(event.usage, model)
-                if math.isfinite(weight) and weight >= 0:
-                    file_values.append(weight)
-                else:
-                    unusable = True
-        except Exception:  # nothing from the failure may leave: the file weighs nothing and counts once
-            unusable = True
-            file_values = []
+        file_values, unusable = _file_weights(owned, meta_model, since, until)
         values.extend(file_values)
         if unusable and index not in flagged:
             skipped += 1

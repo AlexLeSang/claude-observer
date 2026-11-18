@@ -1,7 +1,7 @@
 {
   "name": "usage-observer",
   "displayName": "Usage Observer",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Local-only Claude Code telemetry: captures agents, subagents, skills, tools, tokens, context and cost into the project's own logs/.",
   "author": { "name": "Oleksandr Halushko" },
   "homepage": "https://github.com/alexlesang/claude-observer",
@@ -14,6 +14,18 @@
       "title": "Capture file",
       "description": "Where the plugin appends its records, relative to the project's main checkout (or absolute).",
       "default": "logs/agent-telemetry.mod.jsonl"
+    },
+    "subagentAlerts": {
+      "type": "boolean",
+      "title": "Subagent alerts",
+      "description": "Show one transcript line, and one line in the /observer pane, when a subagent passes its size limit or its time limit. Observe only: nothing is stopped.",
+      "default": true
+    },
+    "cacheLine": {
+      "type": "boolean",
+      "title": "Cache line",
+      "description": "Show one status line with how long each prompt cache stays warm and what a cold return costs (main and up to three subagents). Observe only: nothing is stopped or sent.",
+      "default": true
     }
   },
   "types": "./types/index.d.ts"

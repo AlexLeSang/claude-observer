@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from capture_paths import project_home
-from safe_name import printable_text
+from safe_name import one_line, positive_int, printable_text
 
 __all__ = ["project_home"]  # re-exported: the lookup is shared with agent_telemetry
 
@@ -137,20 +137,22 @@ def head_state(path: Path) -> str:
 def resolve_capture(home: Path, capture_arg: str | None) -> tuple[Path, str]:
     """(path to pass as `--source`, text for the `source:` line). Raises Refusal unless the live capture, or the
     rotated files when it is absent or empty, are plugin captures."""
-    shown = capture_arg if capture_arg is not None else DEFAULT_CAPTURE
-    capture = Path(shown) if Path(shown).is_absolute() else home / shown
+    named = capture_arg if capture_arg is not None else DEFAULT_CAPTURE
+    capture = Path(named) if Path(named).is_absolute() else home / named
+    shown = one_line(named)  # the one place the text for a `source:` line is made: both scripts print it as it is
     live = head_state(capture) if (capture.exists() or capture.is_symlink()) else "absent"
     rotated = [(path, head_state(path)) for path in rotated_files(capture)]
     states = [live, *(state for _, state in rotated)]
     if "other" in states:
-        bad = capture if live == "other" else next(path for path, state in rotated if state == "other")
+        which = "the capture" if live == "other" else "a rotated capture file (.N)"
+        # No path in the text: it holds the home directory, and the output goes on to a model.
         raise Refusal(
-            f"{bad} is not a usage-observer plugin capture (its first records must be plugin records with "
+            f"{which} is not a usage-observer plugin capture (its first records must be plugin records with "
             f'"source": "mod"), so no report was run. Pass the plugin capture with --capture PATH.'
         )
     if "plugin" not in states:
         raise Refusal(
-            f"no plugin capture at {capture} (nor a rotated {capture.name}.N). Run this from the project directory; "
+            "no plugin capture found (nor a rotated .N file). Run this from the project directory; "
             "if the usage-observer plugin's `capture` option was customised, pass that path with --capture PATH."
         )
     return capture, shown
@@ -186,16 +188,6 @@ def label_filter_kept_nothing(report: str) -> bool:
     return by_label + by_session == 0 and dropped > 0
 
 
-def _positive_int(text: str) -> int:
-    try:
-        value = int(text)
-    except ValueError:
-        value = 0
-    if value < 1:
-        raise argparse.ArgumentTypeError(f"must be a positive integer, got {text!r}")
-    return value
-
-
 class _Parser(argparse.ArgumentParser):
     """Every usage error (a missing view, a view that looks like an option) lists the allowed views."""
 
@@ -208,7 +200,7 @@ def run(view: str, limit: int, capture_arg: str | None, cwd: Path) -> int:
     board: Path | None = None
     if view == "tickets":
         if not (home / "kanban" / "tasks").is_dir():
-            raise Refusal(f"this project has no kanban board ({home / 'kanban' / 'tasks'} is not a directory)")
+            raise Refusal("this project has no kanban board (its tasks directory is missing from the project home)")
         board = home / "kanban"
     capture, shown = resolve_capture(home, capture_arg)
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -252,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _Parser(description="Run one bounded usage report over this project's plugin capture.", allow_abbrev=False)
     parser.add_argument("view", help="one of: " + ", ".join(VIEWS))
     parser.add_argument(
-        "--limit", type=_positive_int, default=DEFAULT_LIMIT, help=f"rows per list (default {DEFAULT_LIMIT})"
+        "--limit", type=positive_int, default=DEFAULT_LIMIT, help=f"rows per list (default {DEFAULT_LIMIT})"
     )
     parser.add_argument("--capture", help="the plugin capture, relative to the project home or absolute")
     args = parser.parse_args(argv)

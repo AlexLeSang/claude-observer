@@ -7,7 +7,7 @@ per-dispatch-shape (`fork` vs `fresh` vs `main-session`) usage totals from
 this is the one authoritative "what did this ticket/role/model/dispatch
 shape cost" answer instead of hand-kept notes.
 
-Reuses `scripts/transcript_iterator.py`'s `iter_project_events` (already
+Reuses `scripts/transcript_iterator.py`'s `discover_transcripts` and `iter_events` (already
 message-id-deduplicated) as its only transcript walker --
 this module parses no JSONL itself. It does read each subagent's own
 `.meta.json` a second time (for its `description` field, which
@@ -33,14 +33,14 @@ sonnet-input-equivalent figure,
 `(input + W_write*cacheCreation + 5*output) * W_in + R*cacheRead`.
 W_in is the model's input price relative to Sonnet 5.5's and R its cache-read
 price over Sonnet 5.5's input price (shared table, model_prices.py: W_in Opus
-5.5 2.0, Haiku 4.5 0.5, Fable 5.1 5.0; R Sonnet 5.5 0.05, Opus 5.5 0.1, Opus 5 0.25,
-Fable 5.1 0.125). A row with a prompt-length rate card (Haiku 5.5: W_in 0.05 and R 0.005 for
+5.5 2.0, Haiku 4.5 0.5, Fable 5.2 4.0, Fable 5.1 5.0; R Sonnet 5.5 0.05, Opus 5.5 0.1, Opus 5 0.25,
+Fable 5.2 0.1, Fable 5.1 0.125). A row with a prompt-length rate card (Haiku 5.5: W_in 0.05 and R 0.005 for
 a prompt of at most 100,000 tokens, 0.25 and 0.025 over) is weighed per message by that
 message's prompt length: input + cache read + cache writes (model_prices.py). Cache writes are priced per TTL from the transcript's
 `usage.cache_creation` split: 1.25 for 5-minute writes, 2 for 1-hour writes. A
 write the split does not cover (no split in the usage block) is priced at 1.25
 and counted under "Cache writes without a TTL split", so the totals are a lower
-bound while that section is present. A fast-mode message (`usage.speed` "fast", Opus 5.5 / 5 / 4.8) weighs 2x and each
+bound while that section is present. A fast-mode message (`usage.speed` "fast", Fable 5.2, Mythos 5.2, Opus 5.5 / 5 / 4.8) weighs 2x and each
 web search request adds 5000 (model_prices.py). A model the table lacks (an older
 model, a future id, a missing model) is never guessed at: its messages are
 counted apart as "unpriced models" (requests and raw tokens per model id) and
@@ -173,7 +173,7 @@ def _raw_tokens(usage: Mapping[str, object]) -> int:
     )
 
 
-def _count_unpriced(unpriced: dict[str, dict[str, int]], model: str | None, usage: Mapping[str, object]) -> None:
+def count_unpriced(unpriced: dict[str, dict[str, int]], model: str | None, usage: Mapping[str, object]) -> None:
     tokens = _raw_tokens(usage)
     if tokens == 0:
         return  # Claude Code's `<synthetic>` local-error messages carry zero usage: not a request
@@ -218,13 +218,9 @@ def meta_description(context: ti.TranscriptContext) -> str | None:
     if context.kind != "subagent":
         return None
     meta_path = context.transcript_path.with_suffix("").with_suffix(".meta.json")
-    if not meta_path.is_file():
-        return None
-    try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):  # unreadable, invalid UTF-8, invalid or too deeply nested JSON
-        return None
-    description = meta.get("description") if isinstance(meta, dict) else None
+    # The shared reader: no block on a FIFO, no link followed (also not a parent directory swapped for one since
+    # discovery), a size cap, and {} for anything unreadable, invalid or not an object.
+    description = ti.read_meta(meta_path, context.root).get("description")
     return description if isinstance(description, str) else None
 
 
@@ -237,7 +233,7 @@ def _dispatch_prompt(context: ti.TranscriptContext) -> str | None:
         return None
     from agent_ticket_report import real_prompt_text  # noqa: PLC0415 -- cycle, see ticket_of
 
-    for record in ti.read_jsonl(context.transcript_path):
+    for record in ti.read_jsonl(context.transcript_path, context.root):
         if record.get("type") != "user":
             continue
         message = record.get("message")
@@ -332,6 +328,8 @@ class TranscriptRef:
     role: str
     shape: str
     meta_model: str | None
+    # The project directory the transcript was found under, for link-free reads of its `.meta.json` (not identity).
+    root: Path | None = dataclasses.field(default=None, compare=False, repr=False)
 
 
 def project_transcript_dirs(project_dir: Path) -> list[Path]:
@@ -381,6 +379,7 @@ def load_transcripts(
             role=role_of(context),
             shape=dispatch_shape(context),
             meta_model=context.meta_model,
+            root=context.root,
         )
         loaded[ref] = owned
     return loaded
@@ -410,7 +409,7 @@ def build_report(
             model = event.model or ref.meta_model
             if not is_priced(model):
                 if event.usage is not None:
-                    _count_unpriced(unpriced, model, event.usage)
+                    count_unpriced(unpriced, model, event.usage)
                 continue
             weight = eq_weight(event.usage, model)
             if event.usage is not None:
@@ -518,7 +517,7 @@ def build_context_profile(
             if is_priced(event.model or ref.meta_model):
                 _count_unsplit(unsplit, event.usage)
             else:
-                _count_unpriced(unpriced, event.model or ref.meta_model, event.usage)
+                count_unpriced(unpriced, event.model or ref.meta_model, event.usage)
         contexts = tuple(message_context(event.usage) for event in events)
         weights = tuple(eq_weight(event.usage, event.model or ref.meta_model) for event in events)
         rows.append(
@@ -680,7 +679,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _parse_cli_timestamp(raw: str | None) -> tuple[datetime | None, bool]:
+def parse_cli_timestamp(raw: str | None) -> tuple[datetime | None, bool]:
     """Parses an optional CLI ISO-8601 timestamp argument; the second
     return value is `True` when `raw` was given but failed to parse."""
     if raw is None:  # an empty string was given and is invalid
@@ -689,7 +688,7 @@ def _parse_cli_timestamp(raw: str | None) -> tuple[datetime | None, bool]:
     return parsed, parsed is None
 
 
-def _display_path(path: Path) -> str:
+def display_path(path: Path) -> str:
     """The path with the home directory shown as `~`, so output pasted elsewhere carries no home path."""
     try:
         return "~/" + path.relative_to(Path.home()).as_posix()
@@ -708,8 +707,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--project-dir and --project-root are exclusive")
     if args.project_dir is None:
         args.project_dir = default_project_dir(args.project_root)
-    since, since_invalid = _parse_cli_timestamp(args.since)
-    until, until_invalid = _parse_cli_timestamp(args.until)
+    since, since_invalid = parse_cli_timestamp(args.since)
+    until, until_invalid = parse_cli_timestamp(args.until)
     if since_invalid or until_invalid:
         bad_flag = "--since" if since_invalid else "--until"
         bad_value = args.since if since_invalid else args.until
@@ -721,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if not discover_project_transcripts(args.project_dir):
         # No folder or no transcripts at all: a zero table would read as real zero usage.
-        message = f"no transcripts found at {_display_path(args.project_dir)}"
+        message = f"no transcripts found at {display_path(args.project_dir)}"
         if args.json:
             print(message, file=sys.stderr)
             return 1

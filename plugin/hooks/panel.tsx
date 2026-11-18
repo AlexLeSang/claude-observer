@@ -14,8 +14,8 @@ import {
   sumTokens,
   topTools,
   totalTally,
-} from './live.ts'
-import { MIN_PYTHON, findPython, pythonNames } from './python.ts'
+} from './live'
+import { MIN_PYTHON, findPython, pythonNames } from './python'
 
 export const PANE = 'usage-observer'
 const TITLE = 'Observer'
@@ -24,12 +24,13 @@ const REPORT_TIMEOUT_MS = 30000
 const MAX_REPORT_CHARS = 20000
 
 const liveAtom = atom({ plugin: 'usage-observer', key: 'live' } as const, emptyLive())
+const alertsAtom = atom({ plugin: 'usage-observer', key: 'alerts' } as const, { lines: [] as string[] })
 const viewAtom = atom(
   { plugin: 'usage-observer', key: 'view' } as const,
   { tab: 'live', isLoading: false } as ObserverView,
 )
 
-export type ProjectPaths = { home: string; capture: string }
+type ProjectPaths = { home: string; capture: string }
 
 // Where the reports run and read, set at session.start (a reload runs it again).
 let projectPaths: ProjectPaths = { home: '.', capture: 'logs/agent-telemetry.mod.jsonl' }
@@ -47,7 +48,7 @@ function tokenLine(name: string, t: TokenTally) {
 }
 
 // The live tab as plain lines, so a test can read them without a surface.
-export function liveLines(live: LiveTotals): string[] {
+export function liveLines(live: LiveTotals, alertLines: readonly string[] = []): string[] {
   const total = totalTally(live.models)
   const hit = cacheHitRate(total)
   const lines: string[] = ['Tokens by model']
@@ -72,6 +73,11 @@ export function liveLines(live: LiveTotals): string[] {
     lines.push(`  ${pad(type, 28)} steps ${pad(String(t.steps), 5)} tokens ${compact(sumTokens(t))}`)
   }
 
+  if (alertLines.length > 0) {
+    lines.push('Subagent alerts')
+    for (const line of alertLines) lines.push(`  ${line}`)
+  }
+
   lines.push('Most used tools')
   const used = topTools(live, 'calls', TOP)
   if (used.length === 0) lines.push('  none')
@@ -92,7 +98,7 @@ export function liveLines(live: LiveTotals): string[] {
 // project= label from the settings in `paths.home`; without one it reads the whole capture, which
 // is this project's own file, instead of exiting 2 "no project label found". When it does so it
 // prints its all-projects warning line, which stays in the pane: the scope is then the file.
-export function reportCommands(root: string, paths: ProjectPaths, python: readonly string[]) {
+function reportCommands(root: string, paths: ProjectPaths, python: readonly string[]) {
   return [
     {
       title: 'Tools (report --tools)',
@@ -105,7 +111,50 @@ export function reportCommands(root: string, paths: ProjectPaths, python: readon
   ]
 }
 
-async function runReports($: EngineInterface, paths: ProjectPaths): Promise<HistoryReport[]> {
+export const HINT_TITLE = 'Subagent alerts'
+const HINT_PREFIX = 'hint: '
+const MAX_HINT_CHARS = 300
+const HINT_TIMEOUT_MS = 10000
+// Controls (C0, DEL, C1), line and paragraph separators, zero-width, word-joiner, BOM and bidi marks: a line the
+// pane draws must not move the cursor or reorder text.
+const UNDRAWN = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060\u2066-\u2069\ufeff]/g
+
+// The calibration script's `--count-only` output is `key: value` lines; the one line that starts with
+// `hint: ` is the text for the pane. Output is data: cleaned, cut, and never trusted to be a string.
+export function parseAlertHint(stdout: string): string | undefined {
+  if (typeof stdout !== 'string') return undefined
+  for (const line of stdout.slice(0, MAX_REPORT_CHARS).split('\n')) {
+    if (!line.startsWith(HINT_PREFIX)) continue
+    const text = line.slice(HINT_PREFIX.length).replace(UNDRAWN, ' ').trim().slice(0, MAX_HINT_CHARS)
+    return text === '' ? undefined : text
+  }
+  return undefined
+}
+
+export function calibrationCommand(root: string, paths: ProjectPaths, python: readonly string[]) {
+  return [...python, '-B', `${root}/scripts/agent_alert_calibration.py`, '--count-only', '--capture', paths.capture]
+}
+
+type RunIn = (argv: string[], timeoutMs: number, cwd: string) => Promise<{ exitCode: number; stdout: string; stderr: string }>
+
+// A hint is an extra, never an error: a missing script, a non-zero exit, a timeout or no hint line all give no report.
+export async function alertHintReport(
+  run: RunIn,
+  root: string,
+  paths: ProjectPaths,
+  python: readonly string[],
+): Promise<HistoryReport | undefined> {
+  try {
+    const ran = await run(calibrationCommand(root, paths, python), HINT_TIMEOUT_MS, paths.home)
+    if (ran.exitCode !== 0) return undefined
+    const text = parseAlertHint(ran.stdout)
+    return text === undefined ? undefined : { title: HINT_TITLE, text, ok: true }
+  } catch {
+    return undefined
+  }
+}
+
+export async function runReports($: EngineInterface, paths: ProjectPaths): Promise<HistoryReport[]> {
   const python = await findPython((argv, timeoutMs) => $.process.run(argv, { timeoutMs }))
   if (python === undefined) {
     const text = `no Python ${MIN_PYTHON.major}.${MIN_PYTHON.minor}+ found (tried ${pythonNames()}); the reports need one`
@@ -121,24 +170,17 @@ async function runReports($: EngineInterface, paths: ProjectPaths): Promise<Hist
       out.push({ title: report.title, text: `did not run: ${String(e).slice(0, 200)}`, ok: false })
     }
   }
+  const hint = await alertHintReport(
+    (argv, timeoutMs, cwd) => $.process.run(argv, { cwd, timeoutMs }),
+    $.plugin.root,
+    paths,
+    python,
+  )
+  if (hint !== undefined) out.push(hint)
   return out
 }
 
 export function registerPanel(on: On) {
-  // /clear, /resume and /branch reset $.state: seed it again so the pane reads a
-  // fresh session rather than an empty slot, and the Project tab reloads.
-  on('classic.SessionStart', async ($, e, next) => {
-    try {
-      if (e.source === 'clear' || e.source === 'resume' || e.source === 'fork') {
-        await $.state.set({ plugin: 'usage-observer', key: 'live' } as const, emptyLive())
-        await $.state.set({ plugin: 'usage-observer', key: 'view' } as const, { tab: 'live', isLoading: false })
-      }
-    } catch {
-      // Observation only.
-    }
-    return next(e)
-  })
-
   on('command.run', { command: 'observer' }, async $ => {
     // Under VS Code, `claude -p` and the SDK nothing draws: the pane stays open but undrawn.
     try {
@@ -157,10 +199,11 @@ export function registerPanel(on: On) {
     const { Box, Text, Button, Code } = $.ui.resolve(e)
     const view = await read($, viewAtom)
     const live = await read($, liveAtom)
+    const alerts = await read($, alertsAtom)
     const columns = e.props.bodyColumns
 
     const showProject = async () => {
-      await update($, viewAtom, v => ({ ...v, tab: 'project', isLoading: true }))
+      await update($, viewAtom, (v): ObserverView => ({ ...v, tab: 'project', isLoading: true }))
       const history = await runReports($, projectPaths)
       await update($, viewAtom, v => ({ ...v, history, isLoading: false }))
     }
@@ -172,7 +215,7 @@ export function registerPanel(on: On) {
           label="This session"
           hotkey="1"
           variant={view.tab === 'live' ? 'primary' : 'secondary'}
-          onPress={() => update($, viewAtom, v => ({ ...v, tab: 'live' }))}
+          onPress={() => update($, viewAtom, (v): ObserverView => ({ ...v, tab: 'live' }))}
         />
         <Button
           key="tab-project"
@@ -188,7 +231,7 @@ export function registerPanel(on: On) {
       return (
         <Box flexDirection="column">
           {tabs}
-          {liveLines(live).map((line, i) => (
+          {liveLines(live, alerts.lines).map((line, i) => (
             <Text key={`live-${i}`} dimColor={line.startsWith('  ')}>
               {line.slice(0, columns)}
             </Text>

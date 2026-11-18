@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agent_tool_report as tr
+from agent_context_fill import agent_of
 from agent_iteration_report import NATIVE_TOKEN_KEYS, loop_type
 from safe_name import agent_label
 
@@ -76,6 +77,6 @@ def aggregate_requests(capture: Path, project_filter: ProjectFilter | None = Non
         usage = step.get("usage")
         if not isinstance(usage, dict) or (str(step.get("session")), str(step.get("prompt"))) in event_prompts:
             continue
-        agent = MAIN_SESSION if step.get("agent") is None else agent_label(step.get("agent_type"), "?")
+        agent = MAIN_SESSION if agent_of(step.get("agent")) is None else agent_label(step.get("agent_type"), "?")
         _add(totals, agent, step.get("model"), [tr.as_number(usage.get(key)) for key in NATIVE_TOKEN_KEYS])
     return totals

@@ -45,7 +45,14 @@ from typing import TYPE_CHECKING, Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agent_tool_report as tr
 import transcript_iterator as ti
-from model_prices import CACHE_WRITE_1H, CACHE_WRITE_5M, model_prices, prompt_tokens, unpriced_footer
+from model_prices import (
+    CACHE_WRITE_1H,
+    CACHE_WRITE_5M,
+    FAST_MODE_FACTOR,
+    model_prices,
+    prompt_tokens,
+    unpriced_footer,
+)
 from safe_name import clean_name, clean_name_or
 
 if TYPE_CHECKING:
@@ -329,6 +336,48 @@ def _text_of(content: object) -> str:
     return ""
 
 
+def _skill_use(block: object) -> tuple[str, str] | None:
+    """(tool_use id, skill name) of a well-formed Skill tool_use block, else none."""
+    if not (
+        isinstance(block, dict)
+        and block.get("type") == "tool_use"
+        and block.get("name") == SKILL_TOOL
+        and isinstance(block.get("id"), str)
+        and isinstance(block.get("input"), dict)
+    ):
+        return None
+    name = _skill_name(block["input"].get("skill"))
+    return None if name is None else (block["id"], name)
+
+
+def _slash_name(content: object) -> str | None:
+    """The cleaned name of the first `<command-name>` in a user message's content, else none."""
+    match = COMMAND_NAME.search(_text_of(content))
+    return None if match is None else _skill_name(match.group(1))
+
+
+def _scan_record(
+    record: dict[str, Any],
+    session: str,
+    uses: dict[str, str],
+    slashes: dict[tuple[str, str], str],
+) -> None:
+    """Add what one transcript record says: a Skill tool_use, or the first slash command of a prompt."""
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return
+    content = message.get("content")
+    if record.get("type") == "assistant" and isinstance(content, list):
+        for block in content:
+            use = _skill_use(block)
+            if use is not None:
+                uses[use[0]] = use[1]
+    elif record.get("type") == "user" and isinstance(prompt_id := record.get("promptId"), str):
+        key = (session, prompt_id)
+        if key not in slashes and (name := _slash_name(content)) is not None:
+            slashes[key] = name
+
+
 def _scan_transcripts(sessions: set[str], dirs: list[Path]) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
     """(tool_use_id -> skill of a Skill tool_use, (session, promptId) -> first
     slash command) from the transcripts of `sessions` under `dirs`."""
@@ -338,30 +387,8 @@ def _scan_transcripts(sessions: set[str], dirs: list[Path]) -> tuple[dict[str, s
         for context in ti.discover_transcripts(directory):
             if context.session_id not in sessions:
                 continue
-            for record in ti.read_jsonl(context.transcript_path):
-                message = record.get("message")
-                if not isinstance(message, dict):
-                    continue
-                content = message.get("content")
-                if record.get("type") == "assistant" and isinstance(content, list):
-                    for block in content:
-                        if (
-                            isinstance(block, dict)
-                            and block.get("type") == "tool_use"
-                            and block.get("name") == SKILL_TOOL
-                            and isinstance(block.get("id"), str)
-                            and isinstance(block.get("input"), dict)
-                        ):
-                            name = _skill_name(block["input"].get("skill"))
-                            if name is not None:
-                                uses[block["id"]] = name
-                elif record.get("type") == "user" and isinstance(prompt_id := record.get("promptId"), str):
-                    key = (context.session_id, prompt_id)
-                    match = COMMAND_NAME.search(_text_of(content))
-                    if key not in slashes and match is not None:
-                        name = _skill_name(match.group(1))
-                        if name is not None:
-                            slashes[key] = name
+            for record in ti.read_jsonl(context.transcript_path, context.root):
+                _scan_record(record, context.session_id, uses, slashes)
     return uses, slashes
 
 
@@ -645,6 +672,10 @@ def _overhead_table(overhead: Overhead | None) -> list[str]:
         f"(5-minute rate, {CACHE_WRITE_5M:g}x input; a 1-hour write is {CACHE_WRITE_1H:g}x)"
     )
     lines.append("+ one cache read per later request of that agent, until its run ends or compacts.")
+    lines.append(
+        f"Every request is priced at the standard rate: a fast-mode request, which costs {FAST_MODE_FACTOR:g}x on the "
+        "models that have it, is under-priced here, because the plugin's step record documents no speed."
+    )
     if overhead.assumed_main:
         plural = "s" if overhead.assumed_main != 1 else ""
         lines.append(f"{overhead.assumed_main:,} load{plural} without a Skill tool record, assumed in the main loop")

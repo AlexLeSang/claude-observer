@@ -9,7 +9,7 @@
 // a hooks module may not pass across an import.
 export type Run = (argv: string[], timeoutMs: number) => Promise<{ exitCode: number; stdout: string; stderr: string }>
 
-export const PYTHON_CANDIDATES: readonly (readonly string[])[] = [['python3'], ['python'], ['py', '-3']]
+const PYTHON_CANDIDATES: readonly (readonly string[])[] = [['python3'], ['python'], ['py', '-3']]
 export const MIN_PYTHON = { major: 3, minor: 10 }
 const PROBE_TIMEOUT_MS = 3000
 const MIN_PROBE_MS = 100

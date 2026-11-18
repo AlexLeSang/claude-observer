@@ -49,25 +49,50 @@ TranscriptKind = Literal["main", "subagent"]
 META_MAX_BYTES = 64 * 1024
 
 
-def _open_regular(path: Path) -> int | None:
-    """A read-only fd for a regular, non-symlink file, else None. Never blocks on a FIFO."""
+def _open_below(root: Path, path: Path) -> int:
+    """A read-only fd for `path`, a file under `root`, opened one component at a time from `root` with
+    O_NOFOLLOW at each step (`dir_fd`), so a directory swapped for a symlink after discovery is refused, not
+    followed. `root` itself may be a link: it is the caller's own choice. Raises OSError (ELOOP, ENOTDIR,
+    ENOENT) for a link or a missing part, ValueError for a `path` that is not strictly under `root`."""
+    parts = path.relative_to(root).parts
+    if not parts or ".." in parts:
+        raise ValueError("not under the root")
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    held = os.open(root, os.O_RDONLY | os.O_DIRECTORY | cloexec)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
+        for part in parts[:-1]:
+            step = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | cloexec, dir_fd=held)
+            os.close(held)
+            held = step
+        return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | cloexec, dir_fd=held)
+    finally:
+        os.close(held)
+
+
+def open_regular(path: Path, root: Path | None = None) -> int | None:
+    """A read-only fd for a regular, non-symlink file, else None. Never blocks on a FIFO.
+
+    O_NOFOLLOW covers only the last component. With `root` (the project directory a transcript was found
+    under), no component below it may be a link either: the walk is made from `root` with `dir_fd`, so a parent
+    directory swapped for a symlink between discovery and this open is refused too. Without `root` a symlinked
+    parent is followed (the caller named the path and it holds no trusted base)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK) if root is None else _open_below(root, path)
+    except (OSError, ValueError):
         return None
     try:
         if stat.S_ISREG(os.fstat(fd).st_mode):
             return fd
     except OSError:
-        pass
+        pass  # fstat failed: close the descriptor and refuse the file below
     os.close(fd)
     return None
 
 
-def _read_meta(path: Path) -> dict[str, Any]:
+def read_meta(path: Path, root: Path | None = None) -> dict[str, Any]:
     """The `.meta.json` object, or {} for a missing, symlinked, non-regular, oversized, unreadable, invalid or
     non-object file."""
-    fd = _open_regular(path)
+    fd = open_regular(path, root)
     if fd is None:
         return {}
     try:
@@ -91,6 +116,8 @@ class TranscriptContext:
     kind: TranscriptKind
     agent_type: str | None
     meta_model: str | None
+    # The project directory it was found under: every read of the transcript opens it from there, link-free.
+    root: Path | None = dataclasses.field(default=None, compare=False, repr=False)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -151,6 +178,7 @@ def discover_transcripts(project_dir: Path, *, skip_links: bool = True) -> tuple
                 kind="main",
                 agent_type=None,
                 meta_model=None,
+                root=project_dir,
             )
         )
 
@@ -162,7 +190,7 @@ def discover_transcripts(project_dir: Path, *, skip_links: bool = True) -> tuple
             if skip_links and path.is_symlink():
                 continue
             meta_path = path.with_suffix("").with_suffix(".meta.json")
-            meta = _read_meta(meta_path)
+            meta = read_meta(meta_path, project_dir)
             agent_type = clean_name(meta.get("agentType"))  # hostile text: cleaned for every report
             meta_model = meta.get("model")
             contexts.append(
@@ -172,15 +200,17 @@ def discover_transcripts(project_dir: Path, *, skip_links: bool = True) -> tuple
                     kind="subagent",
                     agent_type=agent_type,
                     meta_model=meta_model,
+                    root=project_dir,
                 )
             )
     return tuple(contexts)
 
 
-def read_jsonl(path: Path) -> Iterator[dict[str, object]]:
-    """The JSON objects of a JSONL file. A symlink or a non-regular file (a FIFO, a device) reads as empty. Lines and total size are not capped here: dropping a long line would silently change every
-    report's totals."""
-    fd = _open_regular(path)
+def read_jsonl(path: Path, root: Path | None = None) -> Iterator[dict[str, object]]:
+    """The JSON objects of a JSONL file. A symlink or a non-regular file (a FIFO, a device) reads as empty, and
+    so does a file under a symlinked directory when `root` (a `TranscriptContext.root`) is given. Lines and total
+    size are not capped here: dropping a long line would silently change every report's totals."""
+    fd = open_regular(path, root)
     if fd is None:
         return
     try:
@@ -201,6 +231,7 @@ def read_jsonl(path: Path) -> Iterator[dict[str, object]]:
 
 def _collect_records(
     transcript_path: Path,
+    root: Path | None = None,
 ) -> tuple[dict[str, list[dict[str, object]]], list[str], list[dict[str, object]]]:
     """One pass over the raw JSONL: every raw line seen for each assistant
     message (by id, in first-seen order, each id's own lines kept in file
@@ -209,7 +240,7 @@ def _collect_records(
     assistant_order: list[str] = []
     tool_results: list[dict[str, object]] = []
 
-    for record in read_jsonl(transcript_path):
+    for record in read_jsonl(transcript_path, root):
         if record.get("type") == "assistant":
             message = record.get("message")
             if not isinstance(message, dict):
@@ -356,16 +387,9 @@ def iter_events(context: TranscriptContext) -> Iterator[TranscriptEvent]:
     `ToolUseEvent` per merged `tool_use` content block within it, and one
     `ToolResultEvent` per `tool_result` content block -- in that order,
     across the deduplicated messages."""
-    records_by_id, assistant_order, tool_results = _collect_records(context.transcript_path)
+    records_by_id, assistant_order, tool_results = _collect_records(context.transcript_path, context.root)
     yield from _assistant_message_events(context, records_by_id, assistant_order)
     yield from _tool_result_events(context, tool_results)
-
-
-def iter_project_events(project_dir: Path) -> Iterator[TranscriptEvent]:
-    """The full walk: every discovered transcript's deduplicated events, in
-    transcript-discovery order."""
-    for context in discover_transcripts(project_dir):
-        yield from iter_events(context)
 
 
 # Largest token count a copy may report and still rank: the numeric readers' own cap
@@ -380,7 +404,10 @@ def _token_field(usage: object, field: str) -> int:
     value = usage.get(field) if isinstance(usage, dict) else None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return 0
-    if not math.isfinite(value) or value < 0 or value > MAX_TOKENS:  # NaN, infinite, negative, huge
+    # An int is compared as it is: `math.isfinite` converts to float first and raises OverflowError on 10**400.
+    if isinstance(value, float) and not math.isfinite(value):  # NaN, infinite
+        return 0
+    if value < 0 or value > MAX_TOKENS:  # negative, huge
         return 0
     return int(value)
 

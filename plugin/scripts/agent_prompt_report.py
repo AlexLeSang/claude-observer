@@ -40,6 +40,7 @@ from agent_usage_report import parse_timestamp
 from safe_name import clean_name
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
     from agent_telemetry import ProjectFilter
@@ -257,33 +258,53 @@ def _event(
         state.requests.append(Request(_s(attrs.get("prompt.id")), agent, cost, like, stamp))
 
 
+_NATIVE_KINDS = ("session_start", "agent_spawn", "measure", "prompt_submit")
+
+
 def _native(out: Capture, record: dict[str, Any], project_filter: ProjectFilter | None) -> None:
     session = _s(record.get("session"))
     kind = record.get("kind")
-    if session is None or kind not in ("session_start", "agent_spawn", "measure", "prompt_submit"):
+    if session is None or kind not in _NATIVE_KINDS:
         return
     if project_filter is not None and not project_filter.keep({"session.id": session}):
         return
     state = out.sessions[session]
-    if kind == "session_start":
-        version = record.get("version")
-        if isinstance(version, str) and VERSION_RE.fullmatch(version):
-            state.version = version
-    elif kind == "agent_spawn":
-        parent, prompt, background = _s(record.get("agent")), _s(record.get("prompt")), record.get("background") is True
-        if parent is None and record.get("denied") is not True:
-            state.root_spawns.append((prompt, background))
-        spawned = _s(record.get("spawned"))
-        if spawned is not None:
-            state.spawns.setdefault(spawned, Spawn(parent, prompt, background))
-    elif kind == "measure":
-        cost = tr.as_cost(record.get("cost_usd"))
-        if cost is not None:
-            state.measures.append((_stamp(record.get("ts")), cost))
-    else:  # prompt_submit
-        prompt, origin = _s(record.get("prompt")), _s(record.get("origin"))
-        if prompt is not None and origin is not None:
-            state.origins.setdefault(prompt, origin)
+    _NATIVE_HANDLERS[kind](state, record)
+
+
+def _native_session_start(state: Session, record: dict[str, Any]) -> None:
+    version = record.get("version")
+    if isinstance(version, str) and VERSION_RE.fullmatch(version):
+        state.version = version
+
+
+def _native_agent_spawn(state: Session, record: dict[str, Any]) -> None:
+    parent, prompt, background = _s(record.get("agent")), _s(record.get("prompt")), record.get("background") is True
+    if parent is None and record.get("denied") is not True:
+        state.root_spawns.append((prompt, background))
+    spawned = _s(record.get("spawned"))
+    if spawned is not None:
+        state.spawns.setdefault(spawned, Spawn(parent, prompt, background))
+
+
+def _native_measure(state: Session, record: dict[str, Any]) -> None:
+    cost = tr.as_cost(record.get("cost_usd"))
+    if cost is not None:
+        state.measures.append((_stamp(record.get("ts")), cost))
+
+
+def _native_prompt_submit(state: Session, record: dict[str, Any]) -> None:
+    prompt, origin = _s(record.get("prompt")), _s(record.get("origin"))
+    if prompt is not None and origin is not None:
+        state.origins.setdefault(prompt, origin)
+
+
+_NATIVE_HANDLERS: dict[str, Callable[[Session, dict[str, Any]], None]] = {
+    "session_start": _native_session_start,
+    "agent_spawn": _native_agent_spawn,
+    "measure": _native_measure,
+    "prompt_submit": _native_prompt_submit,
+}
 
 
 def owner_of(spawns: dict[str, Spawn], agent: str) -> tuple[str, str | None, int]:
@@ -325,76 +346,83 @@ def _label(state: Session, prompt: str, start: datetime | None) -> str:
     return ""
 
 
-def build(capture: Capture, since: datetime | None = None, until: datetime | None = None) -> Result:
-    windowed = since is not None or until is not None
-    prompts: list[PromptRow] = []
-    sessions: list[SessionRow] = []
-    depths: Counter[int] = Counter()
-    versions: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0])
-    differs_n = 0
-    differs_usd = 0.0
-    partition_off: list[str] = []
-    for sid, state in capture.sessions.items():
-        requests = [r for r in state.requests if _within(r.stamp, since, until)]
-        if not requests:
-            continue
-        row = SessionRow(sid, state.version)
-        by_prompt: dict[str, PromptRow] = {}
-        first_seen: dict[str, datetime] = {}
+@dataclass
+class _Totals:
+    """What `build` sums across sessions."""
 
-        def prompt_row(
-            prompt: str, sid: str = sid, state: Session = state, by_prompt: dict[str, PromptRow] = by_prompt
-        ) -> PromptRow:
-            if prompt not in by_prompt:
-                by_prompt[prompt] = PromptRow(sid, prompt, state.starts.get(prompt))
-            return by_prompt[prompt]
+    depths: Counter[int] = field(default_factory=Counter)
+    versions: dict[str, list[int]] = field(default_factory=lambda: defaultdict(lambda: [0, 0, 0]))
+    differs_n: int = 0
+    differs_usd: float = 0.0
+    partition_off: list[str] = field(default_factory=list)
 
-        for request in requests:
-            row.total += request.cost
-            if request.stamp is not None and request.prompt is not None:
-                first_seen[request.prompt] = min(request.stamp, first_seen.get(request.prompt, request.stamp))
-            if request.like:
-                row.like += request.cost
-                row.like_n += 1
-            version_row = versions[state.version]
-            if request.like:
-                version_row[1] += 1
-            if request.agent is not None:
-                version_row[2] += 1
-            owner: str | None
-            if request.agent is None:
-                if request.like:
-                    row.untied_by[NO_ID] += 1
-                    owner = None
-                elif request.prompt is None:
-                    row.untied_by[NO_PROMPT_ID] += 1
-                    owner = None
-                else:
-                    prompt_row(request.prompt).main += request.cost
-                    row.owner += request.cost
-                    continue
-            else:
-                status, owner, depth = owner_of(state.spawns, request.agent)
-                depths[depth] += 1
-                if status == "tied" and owner is not None:
-                    target = prompt_row(owner)
-                    target.sub += request.cost
-                    row.owner += request.cost
-                    row.tied += request.cost
-                    row.tied_n += 1
-                    if owner != request.prompt:
-                        differs_n += 1
-                        differs_usd += request.cost
-                    continue
-                row.untied_by[{"none": NO_SPAWN, "partial": PARTIAL}.get(status, NO_PROMPT)] += 1
+
+class _SessionBuild:
+    """The rows of one session, charged request by request."""
+
+    def __init__(self, sid: str, state: Session, totals: _Totals) -> None:
+        self.sid = sid
+        self.state = state
+        self.totals = totals
+        self.row = SessionRow(sid, state.version)
+        self.by_prompt: dict[str, PromptRow] = {}
+        self.first_seen: dict[str, datetime] = {}
+
+    def prompt_row(self, prompt: str) -> PromptRow:
+        if prompt not in self.by_prompt:
+            self.by_prompt[prompt] = PromptRow(self.sid, prompt, self.state.starts.get(prompt))
+        return self.by_prompt[prompt]
+
+    def charge(self, request: Request) -> None:
+        row = self.row
+        row.total += request.cost
+        if request.stamp is not None and request.prompt is not None:
+            self.first_seen[request.prompt] = min(request.stamp, self.first_seen.get(request.prompt, request.stamp))
+        if request.like:
+            row.like += request.cost
+            row.like_n += 1
+        version_row = self.totals.versions[self.state.version]
+        if request.like:
+            version_row[1] += 1
+        if request.agent is not None:
+            version_row[2] += 1
+        cause = self._own(request)
+        if cause is not None:
+            row.untied_by[cause] += 1
             row.untied += request.cost
             row.untied_n += 1
+
+    def _own(self, request: Request) -> str | None:
+        """Charge `request` to its owner prompt and return None, or return why it is untied."""
+        if request.agent is None:
+            if request.like:
+                return NO_ID
+            if request.prompt is None:
+                return NO_PROMPT_ID
+            self.prompt_row(request.prompt).main += request.cost
+            self.row.owner += request.cost
+            return None
+        status, owner, depth = owner_of(self.state.spawns, request.agent)
+        self.totals.depths[depth] += 1
+        if status == "tied" and owner is not None:
+            self.prompt_row(owner).sub += request.cost
+            self.row.owner += request.cost
+            self.row.tied += request.cost
+            self.row.tied_n += 1
+            if owner != request.prompt:
+                self.totals.differs_n += 1
+                self.totals.differs_usd += request.cost
+            return None
+        return {"none": NO_SPAWN, "partial": PARTIAL}.get(status, NO_PROMPT)
+
+    def finish(self, requests: list[Request], *, windowed: bool) -> None:
+        state, row = self.state, self.row
         for prompt, spawned_bg in ((p, bg) for p, bg in state.root_spawns if p is not None):
-            if prompt in by_prompt:
-                by_prompt[prompt].dispatched += 1
-                by_prompt[prompt].background += spawned_bg
-        for prompt, item in by_prompt.items():
-            item.start = item.start or first_seen.get(prompt)
+            if prompt in self.by_prompt:
+                self.by_prompt[prompt].dispatched += 1
+                self.by_prompt[prompt].background += spawned_bg
+        for prompt, item in self.by_prompt.items():
+            item.start = item.start or self.first_seen.get(prompt)
             item.label = _label(state, prompt, item.start)
         if not windowed and state.measures:
             row.last_measure = _last_measure(state.measures)
@@ -404,19 +432,34 @@ def build(capture: Capture, since: datetime | None = None, until: datetime | Non
             rel_tol=PARTITION_TOLERANCE_REL,
             abs_tol=PARTITION_TOLERANCE_USD,
         ):
-            partition_off.append(sid)
-        versions[state.version][0] += 1
-        prompts.extend(by_prompt.values())
-        sessions.append(row)
+            self.totals.partition_off.append(self.sid)
+        self.totals.versions[state.version][0] += 1
+
+
+def build(capture: Capture, since: datetime | None = None, until: datetime | None = None) -> Result:
+    windowed = since is not None or until is not None
+    prompts: list[PromptRow] = []
+    sessions: list[SessionRow] = []
+    totals = _Totals()
+    for sid, state in capture.sessions.items():
+        requests = [r for r in state.requests if _within(r.stamp, since, until)]
+        if not requests:
+            continue
+        built = _SessionBuild(sid, state, totals)
+        for request in requests:
+            built.charge(request)
+        built.finish(requests, windowed=windowed)
+        prompts.extend(built.by_prompt.values())
+        sessions.append(built.row)
     prompts.sort(key=lambda p: (-p.owner, p.start or datetime.max.replace(tzinfo=timezone.utc), p.session, p.prompt))
     return Result(
         prompts,
         sessions,
-        depths,
-        {v: (c[0], c[1], c[2]) for v, c in versions.items()},
-        differs_n,
-        differs_usd,
-        partition_off,
+        totals.depths,
+        {v: (c[0], c[1], c[2]) for v, c in totals.versions.items()},
+        totals.differs_n,
+        totals.differs_usd,
+        totals.partition_off,
         windowed,
     )
 

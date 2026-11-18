@@ -66,6 +66,7 @@ CONTENT_ATTRIBUTES = frozenset(
         "tool_input",
         "tool_output",
         "tool_result_content",
+        "error",
     }
 )
 
@@ -248,7 +249,7 @@ def is_sensitive_entry(item: object) -> bool:
     )
 
 
-class _RepeatedKey(Exception):  # noqa: N818
+class _RepeatedKey(Exception):  # noqa: N818 - a private signal, not an error name
     """A JSON object in text repeats a key."""
 
 
@@ -266,6 +267,70 @@ def is_identity_entry(item: object) -> bool:
     )
 
 
+def _drop_from_dict(value: dict[Any, Any], depth: int) -> dict[Any, Any]:
+    if is_sensitive_entry(value):  # an entry on its own, as the text's root
+        raise UncheckableError
+    out: dict[Any, Any] = {}
+    for key, item in value.items():
+        if is_content(key) or is_identity(key) or is_sensitive_entry(item):
+            continue
+        if isinstance(key, str) and _names_a_key(key):  # JSON text used as a key
+            raise UncheckableError
+        out[key] = drop_sensitive(item, depth + 1)
+    return out
+
+
+def _repeated_key_text(value: str) -> str:
+    # json.loads keeps the last copy of a repeated key, so a sensitive value in an earlier
+    # copy is invisible to the walk and would be written back unchanged.
+    if _NAMED.search(_normalised(value)):
+        raise UncheckableError from None
+    return value
+
+
+def _cut_text(value: str, text: str) -> str:
+    # A cut `{"tool_output": "te` cannot be cleaned, so a sensitive name in it
+    # means the whole attribute goes. A bracket followed by a word (`[response] timed
+    # out`) is prose, not cut JSON, and is judged like other text.
+    if _cut_json(text):
+        if _NAMED.search(_normalised(value)):
+            raise UncheckableError from None
+    elif _names_a_key(value):
+        raise UncheckableError from None
+    return value
+
+
+def _drop_from_json_text(value: str, text: str, depth: int) -> Any:
+    """`value` (text that starts like JSON, `text` being it without leading space) parsed, cleaned and written back,
+    or as it was when nothing was removed or it does not parse."""
+    try:
+        parsed = json.loads(text, object_pairs_hook=_no_repeat)
+    except RecursionError:
+        raise UncheckableError from None
+    except _RepeatedKey:
+        return _repeated_key_text(value)
+    except ValueError:  # text that only starts like JSON, or JSON cut short
+        return _cut_text(value, text)
+    # Text holding an object or list is that value written out: it stays at this depth, so
+    # the appender (which writes a dict as text) and the scrub (which reads it) agree on the
+    # bound. Text holding a string is another layer of text and counts as a level.
+    clean = drop_sensitive(parsed, depth if isinstance(parsed, (dict, list)) else depth + 1)
+    if clean == parsed:
+        return value
+    if SURROGATE_ESCAPE.search(text):  # only read inside raw_text_output, which clears it first
+        _escape_in_text.append(True)  # raw output could not tell this escape from a bad byte
+    return json.dumps(clean, ensure_ascii=_ensure_ascii)
+
+
+def _drop_from_text(value: str, depth: int) -> Any:
+    text = value.lstrip().lstrip("﻿").lstrip()  # json.loads refuses a BOM
+    if text[:1] in ("{", "[", '"'):  # a quote: JSON text serialized twice
+        return _drop_from_json_text(value, text, depth)
+    if _names_a_key(value):  # JSON, YAML or the like after other text cannot be cleaned
+        raise UncheckableError
+    return value
+
+
 def drop_sensitive(value: Any, depth: int = 0) -> Any:
     """An OTel attribute value without content or identity keys at any depth.
 
@@ -276,54 +341,12 @@ def drop_sensitive(value: Any, depth: int = 0) -> Any:
     if depth > MAX_DEPTH:
         raise UncheckableError
     if isinstance(value, dict):
-        if is_sensitive_entry(value):  # an entry on its own, as the text's root
-            raise UncheckableError
-        out: dict[Any, Any] = {}
-        for key, item in value.items():
-            if is_content(key) or is_identity(key) or is_sensitive_entry(item):
-                continue
-            if isinstance(key, str) and _names_a_key(key):  # JSON text used as a key
-                raise UncheckableError
-            out[key] = drop_sensitive(item, depth + 1)
-        return out
+        return _drop_from_dict(value, depth)
     if isinstance(value, list):
         return [drop_sensitive(item, depth + 1) for item in value if not is_sensitive_entry(item)]
     if not isinstance(value, str):
         return value
-    text = value.lstrip().lstrip("﻿").lstrip()  # json.loads refuses a BOM
-    if text[:1] in ("{", "[", '"'):  # a quote: JSON text serialized twice
-        try:
-            parsed = json.loads(text, object_pairs_hook=_no_repeat)
-        except RecursionError:
-            raise UncheckableError from None
-        except _RepeatedKey:
-            # json.loads keeps the last copy of a repeated key, so a sensitive value in an earlier
-            # copy is invisible to the walk and would be written back unchanged.
-            if _NAMED.search(_normalised(value)):
-                raise UncheckableError from None
-            return value
-        except ValueError:  # text that only starts like JSON, or JSON cut short
-            # A cut `{"tool_output": "te` cannot be cleaned, so a sensitive name in it
-            # means the whole attribute goes. A bracket followed by a word (`[response] timed
-            # out`) is prose, not cut JSON, and is judged like other text.
-            if _cut_json(text):
-                if _NAMED.search(_normalised(value)):
-                    raise UncheckableError from None
-            elif _names_a_key(value):
-                raise UncheckableError from None
-            return value
-        # Text holding an object or list is that value written out: it stays at this depth, so
-        # the appender (which writes a dict as text) and the scrub (which reads it) agree on the
-        # bound. Text holding a string is another layer of text and counts as a level.
-        clean = drop_sensitive(parsed, depth if isinstance(parsed, (dict, list)) else depth + 1)
-        if clean == parsed:
-            return value
-        if SURROGATE_ESCAPE.search(text):  # only read inside raw_text_output, which clears it first
-            _escape_in_text.append(True)  # raw output could not tell this escape from a bad byte
-        return json.dumps(clean, ensure_ascii=_ensure_ascii)
-    if _names_a_key(value):  # JSON, YAML or the like after other text cannot be cleaned
-        raise UncheckableError
-    return value
+    return _drop_from_text(value, depth)
 
 
 # JSON text written back by `drop_sensitive` escapes every non-ASCII character. The scrub of a line with invalid
@@ -349,7 +372,7 @@ def ensure_ascii() -> bool:
 @contextlib.contextmanager
 def raw_text_output() -> Iterator[None]:
     """Inside the block, JSON text written back keeps non-ASCII characters (and lone surrogates) as they are."""
-    global _ensure_ascii  # noqa: PLW0603
+    global _ensure_ascii  # noqa: PLW0603 - a per-process setting set once at start
     before, _ensure_ascii = _ensure_ascii, False
     _escape_in_text.clear()
     try:
@@ -420,7 +443,7 @@ def clean_record(record: dict[str, Any]) -> dict[str, Any]:
     """A capture record as `scrub_capture` would leave it: identity and content removed, and a
     top-level field that cannot be checked left out (counted in `_dropped`). The appender and the
     scrub run this one function, so what the appender writes is a fixed point of the scrub."""
-    global _dropped  # noqa: PLW0603
+    global _dropped  # noqa: PLW0603 - a per-process count of dropped values
     whole = without_entry_record(record)
     if whole is not record:  # a record that is itself an entry: nothing of it is written
         _dropped += 1
@@ -429,7 +452,7 @@ def clean_record(record: dict[str, Any]) -> dict[str, Any]:
     for key, value in base.items():
         try:
             out.update(drop_content({key: value}))
-        except (UncheckableError, RecursionError):  # noqa: PERF203
+        except (UncheckableError, RecursionError):  # noqa: PERF203 - one unreadable value must not stop the others
             _dropped += 1
     return out
 
@@ -471,7 +494,7 @@ def _clean_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
     by `drop_sensitive`, and an attribute too deep to check left out. Too deep also means too deep once
     wrapped: each list level becomes three levels of the record (`arrayValue`, `values`, the list), and
     the record is checked to MAX_RECORD_DEPTH, which would otherwise take the whole payload with it."""
-    global _dropped  # noqa: PLW0603
+    global _dropped  # noqa: PLW0603 - a per-process count of dropped values
     out: dict[str, Any] = {}
     for key, value in attributes.items():
         if is_content(key) or is_identity(key):
@@ -536,19 +559,10 @@ def otel_to_receiver_record(record: dict[str, Any]) -> dict[str, Any]:
     return wrapped
 
 
-def append_batch(
-    capture: Path,
-    batch: str,
-    max_bytes: int = at.DEFAULT_MAX_BYTES,
-    backups: int = at.DEFAULT_BACKUPS,
-    retention_days: int = at.DEFAULT_RETENTION_DAYS,
-    exclude_budget: float = capture_exclude.ENSURE_BUDGET_SECONDS,
-) -> int:
-    """Append every valid line of `batch` in one write; return how many. `exclude_budget` is the seconds the
-    git-exclude step may take afterwards (the final flush passes what its append timeout leaves)."""
+def _clean_batch(batch: str) -> tuple[list[str], int, tuple[datetime, list[dict[str, Any]]] | None]:
+    """The cleaned lines of `batch`, how many lines were skipped, and its newest quota reading."""
     out: list[str] = []
     skipped = 0
-    dropped_before = _dropped
     newest: tuple[datetime, list[dict[str, Any]]] | None = None
     for line in batch.splitlines():
         if not line.strip():
@@ -565,6 +579,21 @@ def append_batch(
         except (ValueError, RecursionError):  # not JSON, or nested past the recursion limit
             skipped += 1
             continue
+    return out, skipped, newest
+
+
+def append_batch(
+    capture: Path,
+    batch: str,
+    max_bytes: int = at.DEFAULT_MAX_BYTES,
+    backups: int = at.DEFAULT_BACKUPS,
+    retention_days: int = at.DEFAULT_RETENTION_DAYS,
+    exclude_budget: float = capture_exclude.ENSURE_BUDGET_SECONDS,
+) -> int:
+    """Append every valid line of `batch` in one write; return how many. `exclude_budget` is the seconds the
+    git-exclude step may take afterwards (the final flush passes what its append timeout leaves)."""
+    dropped_before = _dropped
+    out, skipped, newest = _clean_batch(batch)
     if skipped:
         print(f"mod_capture_append: skipped {skipped} bad line(s)", file=sys.stderr)
     if _dropped > dropped_before:

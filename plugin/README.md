@@ -19,7 +19,7 @@ Claude Code itself emits, mirrored.
   are mirrored as it sends them, except for these attributes, which are dropped by name:
   `user.email`, `user.id`, `user.account_uuid`, `user.account_id`, `organization.id`,
   `vcs.owner.name`, `vcs.repository.name`, `vcs.repository.url.full`, and `prompt`, `prompt_text`,
-  `response`, `tool_parameters`, `tool_input`, `tool_output`, `tool_result_content` (any letter case;
+  `response`, `tool_parameters`, `tool_input`, `tool_output`, `tool_result_content`, `error` (the full error message of a failed `tool_result` or `api_error`; any letter case;
   also dropped when `OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_TOOL_DETAILS` or `OTEL_LOG_TOOL_CONTENT` is
   set), and any attribute that is not a string, number, boolean or list of strings. An attribute
   under another name is kept, so the capture can hold whatever else Claude Code puts in its events.
@@ -33,9 +33,10 @@ Claude Code itself emits, mirrored.
   plugin option). The file is created mode 0600 in a 0700 directory, rotated by size and pruned by
   age. If git does not already ignore it, the plugin adds it to the repository's local
   `.git/info/exclude`; nothing tracked is touched. If that fails, a toast tells you.
-- **Reads of your other local files.** The reports (not the recording) read more than the capture.
-  They print counts and names and send nothing anywhere, but they do open files that hold your
-  conversations:
+- **Reads of your other local files.** The reports read more than the capture, and while you work the plugin
+  itself reads the end of your session transcripts and `alert-calibration.json` (see "What it calls in Claude Code"
+  below). Nothing is sent anywhere. The reports print counts and names, but they do open files that hold
+  your conversations:
   - this project's session transcripts under `~/.claude/projects/<project>/` (including each
     subagent's description and first message), for the Project tab's usage report and for the
     `subagents`, `tickets`, `skills` (for activations the capture does not name) and `plugins` views;
@@ -60,7 +61,7 @@ only released versions). To follow releases only, or to pin one, add a ref after
 
 ```bash
 claude plugin marketplace add alexlesang/claude-observer#stable
-claude plugin marketplace add alexlesang/claude-observer#usage-observer--v0.6.0
+claude plugin marketplace add alexlesang/claude-observer#usage-observer--v0.7.0
 ```
 
 Update with `claude plugin update usage-observer@usage-observer`, then `/reload-plugins`.
@@ -80,32 +81,35 @@ Update with `claude plugin update usage-observer@usage-observer`, then `/reload-
 - Python 3.10 or newer as `python3`, `python` or `py -3` (probed in that order at session start). The
   plugin pipes its records to a bundled script, `scripts/mod_capture_append.py`. With none found,
   capture is off and one toast names the interpreters tried.
-- `git` on the path, to find the project's main checkout (otherwise records go under the session root).
+- `git` on the path, to find the project's main checkout (otherwise records go under the session root) and to tell a tracked calibration file.
 
 ## What it calls in Claude Code
 
 This is a hooks module (a mod): `hooks/hooks.json` lists only `./observer.ts` and wires no command
 hook. Every hook only observes: it calls `next(e)` unchanged and its own body is wrapped so a failure
 there never reaches the session. An excerpt of `claude plugin validate --strict plugin` (the full
-output also lists a "gating hook without .catch" notice for ten of the hooks; the hook and call lists
+output also lists a "gating hook without .catch" notice for 14 of the hooks; the hook and call lists
 below are complete):
 
 ```
-./observer.ts hooks: classic.SessionStart, command.run{command=observer}, ui.render{component=Pane, requestId=usage-observer}, session.start, session.end, classic.*, plugin.register, classic.UserPromptSubmit, prompt.submit, classic.SubagentStart, agent.spawn, agent.offer, turn.start, turn.step, turn.complete, tool.call, skill.prompt, prompt.compose, prompt.context, prompt.attachment, tool.describe, session.compact, session.measure, telemetry.log{to=collector}
-./observer.ts calls: $.agent.list (via agentType), $.clock.every, $.clock.sleep (via announce, flush), $.command.register, $.env.get (via isCloudSession), $.fs.exists (via checkInstall), $.process.run (via checkInstall, flushNow, resolveHome, runReports), $.session.id, $.session.model (via pushAnnounce), $.session.root (via resolveHome), $.session.version (via pushAnnounce), $.settings.read (via pushAnnounce), $.state.get, $.state.set, $.store.get (via announcedIds), $.store.set (via heartbeat, markAnnounced, unannounce), $.ui.open, $.ui.resolve, $.ui.toast (via warnOnce)
+./observer.ts hooks: classic.SessionStart, command.run{command=observer}, ui.render{component=Pane, requestId=usage-observer}, config.set{key="usage-observer.subagentAlerts"}, config.set{key="usage-observer.cacheLine"}, session.start, session.end, classic.*, plugin.register, classic.UserPromptSubmit, prompt.submit, classic.SubagentStop, classic.SubagentStart, agent.spawn, agent.offer, turn.start, turn.step, turn.complete, tool.call, skill.prompt, prompt.compose, prompt.context, prompt.attachment, tool.describe, session.compact, session.measure, telemetry.log{to=collector}
+./observer.ts calls: $.agent.list (via agentType), $.clock.every, $.clock.now (via secondsNow), $.clock.sleep (via announce, flush, watchTimer), $.command.register, $.env.get (via isCloudSession), $.fs.exists (via checkInstall), $.fs.read (via loadCalibration), $.fs.stat (via isNotFile, loadCalibration), $.process.run (via checkInstall, flushNow, isGitTracked, resolveHome, runReports, tailOf), $.session.id, $.session.model (via pushAnnounce), $.session.root (via resolveHome), $.session.version (via pushAnnounce), $.settings.read (via pushAnnounce), $.state.get, $.state.set, $.store.delete (via persist), $.store.get (via loadSlot, persist, slotFor), $.store.set (via heartbeat, persist), $.ui.log (via evaluate), $.ui.open, $.ui.resolve, $.ui.status (via applySwitch, paint), $.ui.toast (via warnOnce)
 ./observer.ts env writes: nothing
 ./observer.ts env reads: CLAUDE_CODE_REMOTE
 ./observer.ts hooks telemetry for: collector
-./observer.ts state writes: usage-observer.live, usage-observer.view
-./observer.ts state reads: usage-observer.live, usage-observer.view
+./observer.ts state writes: usage-observer.alerts, usage-observer.announced, usage-observer.live, usage-observer.view
+./observer.ts state reads: usage-observer.alerts, usage-observer.announced, usage-observer.live, usage-observer.view
 ```
 
 In plain words: it reads the session's id, model, version and root, and the `enabledPlugins` list of
 the merged settings (to record which plugins were enabled; nothing else of the settings). The hooks module
 reads one environment variable, `CLAUDE_CODE_REMOTE`, and writes none (the bundled scripts also read
 `CLAUDE_OBSERVER_CAPTURE`, to override the capture path for reports, and `CLAUDE_CONFIG_DIR`). It starts processes only for `git
-rev-parse` (to find the main checkout), the Python probe, the bundled appender and the bundled report
-scripts. It has no `$.http` call.
+rev-parse` (to find the main checkout), `git ls-files` (to see whether `alert-calibration.json` is tracked), the Python probe, the bundled appender, the bundled report
+scripts and `tail -c` on your session transcripts (the main one and each subagent's, after a model step, to
+read the cache lifetime class; only `5m`, `1h` or `unknown` is kept). It reads `alert-calibration.json`
+next to the capture (`$.fs.stat`, `$.fs.read`; a link or a file git tracks is ignored), shows the cache line and subagent alerts with `$.ui.status`
+and `$.ui.log`, and keeps tallies in `$.store` keyed by session and agent id. It has no `$.http` call.
 
 ## Surfaces
 
@@ -127,6 +131,23 @@ scripts. It has no `$.http` call.
   output line names the capture each number came from. A line `warning: --all-projects reads every
   project's data in the capture` only means no project label was found, so the whole file is read;
   the file is already this project's own.
+- **The cache line** (`ui.status`, on by default; turn it off with the `cacheLine` plugin option): one status
+  row of the plugin's own, drawn above the user's `statusLine`, for the main session and up to three subagents,
+  e.g. `cache main 1h, 59m left, cold $1.00 | sub1 5m, 2:10 left`. Per cache it shows the lifetime in force, the
+  time left and the dollar price of a cold return (the whole prompt and the last output priced as a cache write; `$?`
+  for a model with no price). It turns urgent (`URGENT 0:55 left`) 1 minute before a 5-minute cache expires and 10
+  minutes before a 1-hour cache expires, each cache on its own lifetime, and reads `EXPIRED` with the price after. The
+  lifetime is read again after every step; an unknown one counts as 5 minutes (`5m?`), and while a cache is on 5
+  minutes and you are at or past a plan limit the line says so. The line is fixed words, `main`/`sub<N>` labels and numbers, cut to about 120 characters, and
+  it only observes. Seen on Claude Code 2.1.322 with `fullscreenLayout` on, only: the harness adds a warning glyph and the plugin's name in
+  front of it, and both rows are hidden in the detailed transcript view and under a dialog. That the option applies to a running session without a reload, and that the row then clears, is designed but
+  UNVERIFIED on a live session.
+- **Subagent alerts** (on by default; the `subagentAlerts` plugin option turns them off): one `ui.log` line in the
+  transcript and one in the `/observer` pane when a subagent passes a size limit (tokens used) or a time limit
+  (active time), each alert at most once per subagent (a restart before the tally is saved can repeat it). Before calibration the limits are 10,000,000 tokens and 2 hours. The bundled
+  `calibrate-alerts` skill (`scripts/agent_alert_calibration.py`) shows what other limits would have flagged in the
+  project's own capture and, after you agree to the numbers, writes `alert-calibration.json` next to the capture
+  (needs at least 100 past subagents; a file tracked by git or a link is ignored and the script refuses to write it). Nothing is stopped, killed or sent.
 
 ## Limits
 

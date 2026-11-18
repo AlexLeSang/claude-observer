@@ -135,11 +135,62 @@ def _row(session: sr.Session, whole: sr.Session | None = None) -> list[str]:
     return [
         _code(tr.session_label(session.session)),
         started,
-        sr._cost(session),  # noqa: SLF001
+        sr.format_cost(session),
         as_int(session.tokens),
-        sr._percent(session.cache_percent),  # noqa: SLF001
+        sr.format_percent(session.cache_percent),
         _names(session.models),
         _names(session.efforts),
+    ]
+
+
+def _notes_block(notes: list[str]) -> list[str]:
+    """The `## Notes` section, or nothing when there are no notes."""
+    return ["## Notes", "", *(f"- {note}" for note in notes), ""] if notes else []
+
+
+def _totals_block(total: sr.Session, count: int) -> list[str]:
+    """The `## Totals` section of the whole window."""
+    cost, tokens = sr.format_cost(total), as_int(total.tokens)
+    cache = sr.format_percent(total.cache_percent, 1)
+    side_requests = sr.format_percent(total.side_request_share)
+    side_cost = sr.format_percent(total.side_cost_share)
+    requests = f"{total.requests:,} ({total.iterations:,} loop, {total.side_requests:,} side)"
+    return [
+        "## Totals",
+        "",
+        f"- Sessions: {count:,}; model requests: {requests}",
+        f"- Cost: {cost}; tokens: {tokens}; cache read share: {cache}",
+        f"- Side requests: {side_requests} of requests, {side_cost} of cost",
+        f"- Models (loop requests): {_names(total.models)}; effort: {_names(total.efforts)}",
+        f"- Compactions: {total.compactions:,}",
+        "",
+    ]
+
+
+def _sessions_block(sessions: list[sr.Session], clipped: dict[str, sr.Session], top: int) -> list[str]:
+    """The one-session table, or the table of the `top` costliest sessions."""
+    header = ["session", "started", "cost", "tokens", "cache", "models", "effort"]
+    if len(sessions) == 1:
+        return ["## Session", "", *_md_table(header, [_row(sessions[0], clipped.get(sessions[0].session))]), ""]
+    costliest = sorted(sessions, key=lambda s: (-s.cost, s.session))[:top]
+    return [
+        f"## Costliest sessions (top {len(costliest)} of {len(sessions)})",
+        "",
+        *_md_table(header, [_row(s, clipped.get(s.session)) for s in costliest]),
+        "",
+    ]
+
+
+def _worth_a_look_block(sessions: list[sr.Session], clipped: dict[str, sr.Session]) -> list[str]:
+    """The flagged sessions (never a clipped one), or nothing when none is flagged."""
+    flagged = [(s, flags) for s in sessions if s.session not in clipped and (flags := _flags(s))]
+    if not flagged:
+        return []
+    return [
+        "## Worth a look",
+        "",
+        *(f"- {_code(tr.session_label(s.session))}: {'; '.join(flags)}" for s, flags in flagged),
+        "",
     ]
 
 
@@ -164,41 +215,12 @@ def format_digest(
         notes.append(unreadable_note(unreadable))
     if not sessions:
         lines += ["No sessions with model requests in this window.", ""]
-        if notes:
-            lines += ["## Notes", "", *(f"- {note}" for note in notes), ""]
-        return "\n".join(lines)
+        return "\n".join(lines + _notes_block(notes))
 
     total = _total(sessions)
-    cost, tokens = sr._cost(total), as_int(total.tokens)  # noqa: SLF001
-    cache = sr._percent(total.cache_percent, 1)  # noqa: SLF001
-    side_requests = sr._percent(total.side_request_share)  # noqa: SLF001
-    side_cost = sr._percent(total.side_cost_share)  # noqa: SLF001
-    requests = f"{total.requests:,} ({total.iterations:,} loop, {total.side_requests:,} side)"
-    lines += [
-        "## Totals",
-        "",
-        f"- Sessions: {len(sessions):,}; model requests: {requests}",
-        f"- Cost: {cost}; tokens: {tokens}; cache read share: {cache}",
-        f"- Side requests: {side_requests} of requests, {side_cost} of cost",
-        f"- Models (loop requests): {_names(total.models)}; effort: {_names(total.efforts)}",
-        f"- Compactions: {total.compactions:,}",
-        "",
-    ]
-
-    header = ["session", "started", "cost", "tokens", "cache", "models", "effort"]
-    costliest = sorted(sessions, key=lambda s: (-s.cost, s.session))[:top]
-    if len(sessions) == 1:
-        lines += ["## Session", "", *_md_table(header, [_row(sessions[0], clipped.get(sessions[0].session))]), ""]
-    else:
-        lines += [f"## Costliest sessions (top {len(costliest)} of {len(sessions)})", ""]
-        lines += [*_md_table(header, [_row(s, clipped.get(s.session)) for s in costliest]), ""]
-
-    flagged = [(s, flags) for s in sessions if s.session not in clipped and (flags := _flags(s))]
-    if flagged:
-        lines += ["## Worth a look", ""]
-        lines += [f"- {_code(tr.session_label(s.session))}: {'; '.join(flags)}" for s, flags in flagged]
-        lines.append("")
-
+    lines += _totals_block(total, len(sessions))
+    lines += _sessions_block(sessions, clipped, top)
+    lines += _worth_a_look_block(sessions, clipped)
     if clipped:
         notes.append(
             f"Clipped sessions ({len(clipped):,}): started before the window or ran past it; started is the "
@@ -209,9 +231,7 @@ def format_digest(
     missing = sum(s.peak_context is None for s in sessions)
     if missing:
         notes.append(f"peak context needs the plugin capture; {plural(missing, 'session')} without it")
-    if notes:
-        lines += ["## Notes", "", *(f"- {note}" for note in notes), ""]
-    return "\n".join(lines)
+    return "\n".join(lines + _notes_block(notes))
 
 
 def scope_label(days: int | None, since: datetime | None, until: datetime | None, last_session: bool) -> str:
@@ -265,6 +285,22 @@ class RefusedTargetError(Exception):
     """The digest would overwrite something that is not an earlier digest."""
 
 
+def _read_head(path: Path) -> bytes | None:
+    """The first bytes of `path`, as many as the digest heading; None when it has vanished. Opened with
+    O_NONBLOCK and checked on the descriptor: the `stat` that said "regular file" is older than this open, and a
+    FIFO put there since would block `open` forever. A symlink is followed on purpose (see `_check_target`)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RefusedTargetError(f"--out {path.name} exists and is not a regular file; refusing to replace it")
+        return os.pread(fd, len(DIGEST_HEADING), 0)
+    finally:
+        os.close(fd)
+
+
 def _check_target(path: Path, protect: Sequence[Path]) -> None:
     """Refuse to replace the capture (same path, symlink or hardlink), any regular file
     that does not begin with the digest heading, and any existing pipe, socket or device (opening
@@ -284,8 +320,9 @@ def _check_target(path: Path, protect: Sequence[Path]) -> None:
     if not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
         raise RefusedTargetError(f"--out {path.name} exists and is not a regular file; refusing to replace it")
     if stat.S_ISREG(mode):
-        with path.open("rb") as handle:
-            head = handle.read(len(DIGEST_HEADING))
+        head = _read_head(path)
+        if head is None:
+            return  # gone since the stat above: nothing to protect
         if head != DIGEST_HEADING.encode():
             raise RefusedTargetError(
                 f"--out {path.name} exists and does not begin with '{DIGEST_HEADING}'; "

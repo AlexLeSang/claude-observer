@@ -291,7 +291,7 @@ def _worktree_project(cwd: Path) -> str | None:
                 if target is not None and target.is_dir() and target.parent == (git_dir / "worktrees").resolve():
                     return slug_of(parent)
             except (OSError, ValueError):
-                continue
+                continue  # an unreadable or odd gitdir: not this ancestor's worktree
     return None
 
 

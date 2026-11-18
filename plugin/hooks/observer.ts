@@ -12,9 +12,25 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 import type { LiveTotals } from '../types'
-import { applyMeasure, applySkill, applyStep, applyTool, emptyLive } from './live.ts'
-import { registerPanel, setProjectPaths } from './panel.tsx'
-import { MIN_PYTHON, findPython, pythonNames } from './python.ts'
+import { alertLoadCalibration, alertStepEnd, alertTelemetry, alertTick, alertTurnEnd, alertTurnStart, registerAlerts } from './alertEvents'
+import {
+  cacheClockMs,
+  cacheMeasure,
+  cacheSessionStart,
+  cacheSpawned,
+  cacheSpawnTime,
+  cacheStepEndSoon,
+  cacheSubagentStop,
+  cacheToolCall,
+  cacheTurnComplete,
+  cacheUserPrompt,
+  cachePromptSubmit,
+  registerCacheLine,
+} from './cacheEvents'
+import { applyMeasure, applySkill, applyStep, applyTool, emptyLive } from './live'
+import type { Feed } from './feed'
+import { registerPanel, setProjectPaths } from './panel'
+import { MIN_PYTHON, findPython, pythonNames } from './python'
 import {
   IDENTITY_ATTRIBUTES,
   agentFields,
@@ -39,10 +55,10 @@ import {
   stepRecord,
   toolRecord,
   type ObserverRecord,
-} from './records.ts'
+} from './records'
+import { pushCapped, requeueCapped } from './buffer'
 
 const FLUSH_MS = 5000
-const MAX_BUFFER = 2000
 // $.store is shared by every session on the machine, so the key names the capture.
 const HEARTBEAT_PREFIX = 'heartbeat:'
 // Per capture, the ids of the sessions announced and not yet ended, in $.state: a reload resets the
@@ -115,6 +131,25 @@ let probedAt = 0
 const liveAtom = atom({ plugin: 'usage-observer', key: 'live' } as const, emptyLive())
 const announcedAtom = atom({ plugin: 'usage-observer', key: 'announced' } as const, {} as Record<string, string[]>)
 
+// The engine calls the feeds in alertEvents.ts and cacheEvents.ts make. The engine's scan follows `$` only
+// within a file, so each call is spelled here and the feeds get this object, never `$`.
+function feedOf($: EngineInterface): Feed {
+  return {
+    store: {
+      get: key => $.store.get(key),
+      set: (key, value) => $.store.set(key, value),
+      delete: key => $.store.delete(key),
+    },
+    // The engine wants a literal reference at the call, so the one key the alerts write is spelled here.
+    state: { set: (_key, value) => $.state.set({ plugin: 'usage-observer', key: 'alerts' } as const, value) },
+    ui: { log: text => $.ui.log(text), status: text => $.ui.status(text) },
+    session: { id: () => $.session.id() },
+    fs: { stat: path => $.fs.stat(path), read: path => $.fs.read(path) },
+    process: { run: (argv, options) => $.process.run(argv, options) },
+    clock: { now: () => $.clock.now(), every: (ms, fn) => $.clock.every(ms, fn) },
+  }
+}
+
 // Every record leaves push() with this load's nonce and the next sequence number. A batch re-queued
 // after a timeout keeps its stamps, so when the appender had written it anyway, the readers drop the
 // repeat by (run, seq).
@@ -122,8 +157,7 @@ const RUN = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)
 let seq = 0
 
 function push(record: ObserverRecord) {
-  if (buffer.length >= MAX_BUFFER) buffer.shift()
-  buffer.push({ ...record, run: RUN, seq: seq++ })
+  pushCapped(buffer, { ...record, run: RUN, seq: seq++ })
 }
 
 function now() {
@@ -264,6 +298,12 @@ async function resolveCapture($: EngineInterface, option: string) {
   return `${await resolveHome($)}/${option}`
 }
 
+// The directory of an absolute path; `.` for a bare name.
+function dirOf(path: string) {
+  const cut = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  return cut > 0 ? path.slice(0, cut) : cut === 0 ? '/' : '.'
+}
+
 function missingPython() {
   return `no Python ${MIN_PYTHON.major}.${MIN_PYTHON.minor}+ found (tried ${pythonNames()})`
 }
@@ -376,8 +416,7 @@ async function flushNow($: EngineInterface, timeoutMs: number, isFinal: boolean,
 // it in order. The newest MAX_BUFFER stay. After a timeout the appender may have written the
 // batch anyway, so a retry can repeat records; losing them would be worse.
 function requeue(batch: ObserverRecord[]) {
-  buffer.unshift(...batch)
-  if (buffer.length > MAX_BUFFER) buffer.splice(0, buffer.length - MAX_BUFFER)
+  requeueCapped(buffer, batch)
 }
 
 // The interpreter and the scripts the appender needs, checked once at session.start. Each
@@ -415,7 +454,7 @@ async function agentType($: EngineInterface, agentId: string | undefined) {
 }
 
 // The live totals behind /observer, kept in $.state so a reload keeps them.
-// There is no live status line: the operator asked for reports, /observer and a digest.
+// The only status line is the cache line (cacheEvents.ts); live totals go to the /observer pane.
 async function track($: EngineInterface, change: (live: LiveTotals) => LiveTotals) {
   try {
     await update($, liveAtom, change)
@@ -439,6 +478,24 @@ export const register: Register = (on, options) => {
   const captureOption = String(options.capture ?? 'logs/agent-telemetry.mod.jsonl')
 
   registerPanel(on)
+  registerAlerts(on, options)
+  registerCacheLine(on, options)
+
+  // /clear, /resume and /branch reset $.state: seed it again so the pane reads a fresh session rather than an
+  // empty slot, and the Project tab reloads. It also feeds the cache line, whose engine takes one unmatched
+  // handler of this event. The handler is here because the engine follows `$` only within one file.
+  on('classic.SessionStart', async ($, e, next) => {
+    await cacheSessionStart(feedOf($), e)
+    try {
+      if (e.source === 'clear' || e.source === 'resume' || e.source === 'fork') {
+        await $.state.set({ plugin: 'usage-observer', key: 'live' } as const, emptyLive())
+        await $.state.set({ plugin: 'usage-observer', key: 'view' } as const, { tab: 'live', isLoading: false })
+      }
+    } catch {
+      // Observation only.
+    }
+    return next(e)
+  })
 
   on('session.start', async ($, e, next) => {
     // The container, and the capture in it, is lost when the session ends, and an agent there could
@@ -463,12 +520,14 @@ export const register: Register = (on, options) => {
       setProjectPaths({ home: await resolveHome($), capture: capturePath })
       startInfo = { interactive: e.isInteractive, surface: e.surface }
       await announce($)
+      await alertLoadCalibration(feedOf($), dirOf(capturePath))
       // Timers stop when the module reloads, and session.start fires once per load, not after /clear.
       // A refused clock.every is not seen here: the engine logs it and hands back a handle that does
       // nothing, neither throwing nor rejecting (watchTimer notices the missing ticks).
       await $.clock.every(FLUSH_MS, () => {
         tickSeen = true
         if (inFlight === 0) void flush($).catch(() => undefined)
+        void alertTick(feedOf($)).catch(() => undefined)
       })
       void watchTimer($)
     } catch {
@@ -541,12 +600,15 @@ export const register: Register = (on, options) => {
 
   on('classic.UserPromptSubmit', async ($, e, next) => {
     promptId = e.prompt_id ?? promptId
+    await cacheUserPrompt(e)
     return next(e)
   })
 
   // The prompt's origin kind, so a prompt nobody typed (a task notification) can be told from one that was.
   // Recorded after `next`: by then the prompt has entered the session and `promptId` is its own.
   on('prompt.submit', async ($, e, next) => {
+    // The prompt's own time is taken before the engine runs it: never later than its first request.
+    await cachePromptSubmit(feedOf($))
     const result = await next(e)
     try {
       push({ ...(await base($, 'prompt_submit')), ...promptSubmitRecord(e) })
@@ -556,13 +618,20 @@ export const register: Register = (on, options) => {
     return result
   })
 
+  on('classic.SubagentStop', async ($, e, next) => {
+    await cacheSubagentStop(feedOf($), e)
+    return next(e)
+  })
+
   on('classic.SubagentStart', async ($, e, next) => {
     agentTypes.set(e.agent_id, e.agent_type)
     return next(e)
   })
 
   on('agent.spawn', async ($, e, next) => {
+    const spawnedAt = await cacheSpawnTime(feedOf($))
     const result = await next(e)
+    await cacheSpawned(spawnedAt, result)
     try {
       if (result.agentId !== undefined) agentTypes.set(result.agentId, e.subagentType)
       push({ ...(await base($, 'agent_spawn')), ...spawnRecord(e, result) })
@@ -587,7 +656,9 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
+    const startedAt = Date.now()
     const result = await next(e)
+    await alertTurnStart(feedOf($), e, startedAt)
     try {
       push({ ...(await base($, 'turn_start')), turn: e.turnId, prompt_chars: e.text.length })
     } catch {
@@ -603,8 +674,13 @@ export const register: Register = (on, options) => {
     while (true) {
       const step = await stream.next()
       if (step.done) {
+        // The step's end is taken before any other work, so the cache line never counts a later one.
+        const endedAt = await cacheClockMs(feedOf($))
+        // Each feed has its own try: a failure of the type lookup, the record or the live totals must not
+        // starve the subagent alerts, nor the alerts' failure the record.
+        let type: string | undefined
         try {
-          const type = await agentType($, e.agentId)
+          type = await agentType($, e.agentId)
           push({
             ...(await base($, 'step')),
             ...stepRecord(e, step.value, thinkingChars, Date.now() - startedAt),
@@ -614,6 +690,14 @@ export const register: Register = (on, options) => {
         } catch {
           // Observation only.
         }
+        try {
+          await alertStepEnd(feedOf($), e, step.value.usage, startedAt, type)
+        } catch {
+          // Observation only.
+        }
+        // Returns at once: the cache line's transcript read runs on its own and must not hold the model step
+        // (UNVERIFIED whether the engine waits on this handler's promise, so none is left open).
+        await cacheStepEndSoon(feedOf($), e, step.value.usage, endedAt)
         return step.value
       }
       if (step.value.kind === 'thinking') thinkingChars += step.value.text.length
@@ -622,7 +706,10 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.complete', async ($, e, next) => {
+    const endedAt = Date.now()
     const result = await next(e)
+    await alertTurnEnd(feedOf($), e, endedAt)
+    await cacheTurnComplete(e)
     try {
       push({
         ...(await base($, 'turn')),
@@ -654,6 +741,7 @@ export const register: Register = (on, options) => {
     } catch {
       // Observation only.
     }
+    await cacheToolCall(feedOf($))
     return result
   })
 
@@ -752,12 +840,14 @@ export const register: Register = (on, options) => {
     } catch {
       // Observation only.
     }
+    await cacheMeasure(feedOf($), e)
     return next(e)
   })
 
   on('telemetry.log', { to: 'collector' }, async ($, e, next) => {
     try {
       if (e.to === 'collector') push(otelRecord(e, IDENTITY_ATTRIBUTES))
+      await alertTelemetry(feedOf($), e)
     } catch {
       // Observation only.
     }

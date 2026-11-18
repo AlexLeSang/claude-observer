@@ -141,13 +141,13 @@ _rejected_fields: dict[tuple[int, str], object] = {}
 
 
 def reset_rejected() -> None:
-    global _rejected  # noqa: PLW0603
+    global _rejected  # noqa: PLW0603 - a per-process counter read by the report
     _rejected = 0
     _rejected_fields.clear()
 
 
 def _count_rejected(owner: object | None, field: str) -> None:
-    global _rejected  # noqa: PLW0603
+    global _rejected  # noqa: PLW0603 - a per-process counter read by the report
     if owner is not None:
         key = (id(owner), field)
         if key in _rejected_fields:
@@ -194,7 +194,7 @@ def as_number(value: object, cap: float = MAX_NUMBER, *, owner: object | None = 
     if isinstance(value, str) and (not value.isascii() or "_" in value):
         return None  # float() would read "٣" or "1_0" as a number: an exporter writes neither
     try:
-        number = float(value)  # type: ignore[arg-type]
+        number = float(value)  # type: ignore[arg-type]  # value is any object here; a TypeError or ValueError is caught below
     except OverflowError:  # an int too large for a float
         _count_rejected(owner, field)
         return None
@@ -357,7 +357,7 @@ class ToolSummary:
     unattributed_cost: float
 
 
-def summarize(events: ToolEvents) -> ToolSummary:
+def _tally_calls(events: ToolEvents) -> tuple[dict[str, ToolStats], dict[str, Counter[str]]]:
     tools: dict[str, ToolStats] = defaultdict(ToolStats)
     calls_per_prompt: dict[str, Counter[str]] = defaultdict(Counter)
     for call in events.calls:
@@ -375,10 +375,16 @@ def summarize(events: ToolEvents) -> ToolSummary:
             stats.durations.append(call.duration_ms)
         if call.result_bytes is not None:
             stats.result_bytes.append(call.result_bytes)
+    return tools, calls_per_prompt
 
-    # Call-share attribution: a prompt's API usage is split across the tools it
-    # called in proportion to call count. Approximate by design -- the cost of a
-    # turn is mostly cache reads of the whole context, not of any one result.
+
+def _attribute_usage(
+    events: ToolEvents, tools: dict[str, ToolStats], calls_per_prompt: dict[str, Counter[str]]
+) -> tuple[float, float]:
+    """Call-share attribution: a prompt's API usage is split across the tools it
+    called in proportion to call count. Approximate by design -- the cost of a
+    turn is mostly cache reads of the whole context, not of any one result.
+    Returns the (tokens, cost) of prompts that called no tool."""
     unattributed_tokens = unattributed_cost = 0.0
     for prompt, (tokens, cost) in events.prompt_usage.items():
         mix = calls_per_prompt.get(prompt)
@@ -390,7 +396,10 @@ def summarize(events: ToolEvents) -> ToolSummary:
         for tool, count in mix.items():
             tools[tool].attributed_tokens += tokens * count / total
             tools[tool].attributed_cost += cost * count / total
+    return unattributed_tokens, unattributed_cost
 
+
+def _tally_decisions(events: ToolEvents) -> dict[str, DecisionStats]:
     decisions: dict[str, DecisionStats] = defaultdict(DecisionStats)
     for decision in events.decisions:
         decision_stats = decisions[decision.tool]
@@ -399,7 +408,13 @@ def summarize(events: ToolEvents) -> ToolSummary:
         decision_stats.rejects += decision.decision == "reject"
         decision_stats.sources[decision.source] += 1
         decision_stats.tool_sources[decision.tool_source] += 1
+    return decisions
 
+
+def summarize(events: ToolEvents) -> ToolSummary:
+    tools, calls_per_prompt = _tally_calls(events)
+    unattributed_tokens, unattributed_cost = _attribute_usage(events, tools, calls_per_prompt)
+    decisions = _tally_decisions(events)
     return ToolSummary(
         tools=dict(tools),
         decisions=dict(decisions),

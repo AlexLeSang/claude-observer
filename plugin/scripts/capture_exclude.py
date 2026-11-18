@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import math
 import os
 import stat
 import subprocess
@@ -79,14 +80,15 @@ _COMMENT = b"# usage-observer plugin: local capture, never commit (added automat
 _GLOB_CHARS = frozenset(b"\\*?[] ")
 
 
-def git(
+def _run(
     cwd: Path, args: list[str], deadline: float, stdin: bytes | None = None
-) -> subprocess.CompletedProcess[bytes] | None:
-    """`git <args>` in `cwd` without the variables that redirect git; None when git is missing, hangs, or the
-    `deadline` (time.monotonic) has passed."""
+) -> tuple[subprocess.CompletedProcess[bytes] | None, bool]:
+    """`git <args>` in `cwd` without the variables that redirect git, and whether git ran out of time: (None, True)
+    when the `deadline` (time.monotonic) had passed or git hung past it, (None, False) when git is missing or
+    could not start."""
     left = deadline - time.monotonic()
     if left <= 0:
-        return None
+        return None, True
     env = {key: value for key, value in os.environ.items() if key not in _GIT_ENV_DROPPED}
     # The repository's own config is untrusted (a clone the user did not write): `core.fsmonitor` makes
     # `git ls-files` run the program it names (measured, git 2.x), so it is switched off for every call. The
@@ -94,7 +96,7 @@ def git(
     # controlled. No optional lock: these are read-only questions.
     env["GIT_OPTIONAL_LOCKS"] = "0"
     try:
-        return subprocess.run(
+        ran = subprocess.run(
             ["git", "-c", "core.fsmonitor=false", *args],
             cwd=cwd,
             env=env,
@@ -103,8 +105,19 @@ def git(
             timeout=min(GIT_TIMEOUT_SECONDS, left),
             check=False,
         )
+    except subprocess.TimeoutExpired:
+        return None, True
     except (OSError, subprocess.SubprocessError):
-        return None
+        return None, False
+    return ran, False
+
+
+def git(
+    cwd: Path, args: list[str], deadline: float, stdin: bytes | None = None
+) -> subprocess.CompletedProcess[bytes] | None:
+    """`git <args>` in `cwd` without the variables that redirect git; None when git is missing, hangs, or the
+    `deadline` (time.monotonic) has passed."""
+    return _run(cwd, args, deadline, stdin)[0]
 
 
 def _out(ran: subprocess.CompletedProcess[bytes] | None) -> bytes | None:
@@ -262,29 +275,65 @@ def tracked_warning(top: Path, rel: bytes, deadline: float, what: str) -> str | 
     return None
 
 
-def _ensure(capture: Path, deadline: float, *, sidecars: bool = True, what: str = "capture") -> str | None:
+def is_tracked(path: Path, budget: float = GIT_TIMEOUT_SECONDS) -> bool:
+    """Whether git lists `path` in its index: a file a cloned repository ships. Each of its two git calls gets
+    `budget` seconds (the mod allows 3 s for its one). It fails closed: a call that ran out of time is True,
+    "git did not say", so the doctor warns and `--write` refuses a file that may be tracked. False for a file
+    outside a work tree, a directory that is gone, no git, or a plain "no" from git (not a repository, not
+    listed). The same question and the same safeguards (`_run`: no `core.fsmonitor`, no redirecting variables)
+    as `tracked_warning`."""
+    seconds = 0.0 if math.isnan(budget) else budget  # NaN is no time at all
+    try:
+        parent = path.parent.resolve()
+        top_ran, timed_out = _run(parent, ["rev-parse", "--show-toplevel"], time.monotonic() + max(seconds, 0.0))
+        if timed_out:
+            return True
+        top_out = _out(top_ran)
+        if top_out is None or path.name in ("", ".", ".."):
+            return False
+        top = Path(os.fsdecode(top_out)).resolve()
+        rel = os.fsdecode(os.fsencode((parent / path.name).relative_to(top).as_posix()))
+        ran, timed_out = _run(
+            top, ["ls-files", "-z", "--", ":(literal,icase)" + rel], time.monotonic() + max(seconds, 0.0)
+        )
+    except (OSError, ValueError, UnicodeError):
+        return False
+    if timed_out:
+        return True
+    return ran is not None and ran.returncode == 0 and bool(ran.stdout)
+
+
+def _locate(capture: Path, deadline: float) -> tuple[Path, bytes] | None:
+    """The work tree's top and the capture's path under it (`/`-separated bytes); None when there is nothing to
+    exclude: no such directory, not a git repo, a bare one, git missing, the capture outside the work tree, or a
+    name that is no file name."""
     parent = capture.parent.resolve()  # through symlinks: git sees where the file really is
     top_out = _out(git(parent, ["rev-parse", "--show-toplevel"], deadline))
     if top_out is None:
-        return None  # no such directory, not a git repo, a bare one, or git is missing
+        return None
     top = Path(os.fsdecode(top_out)).resolve()
     try:
         rel_path = (parent / capture.name).relative_to(top)
     except ValueError:
-        return None  # the capture is outside the work tree
+        return None
     if capture.name in ("", ".", ".."):
         return None
-    rel = os.fsencode(rel_path.as_posix())
-    if _unsafe(rel):
-        return f"{WARNING_PREFIX} the {what} path has a control character, so it is not added to .git/info/exclude"
-    probes = [rel + suffix for suffix in (PROBE_SUFFIXES if sidecars else (b"",))]
-    missing = unignored(top, probes, deadline)
-    if not missing:  # all ignored already, or git could not answer (the tracked check then fails the same way)
-        return tracked_warning(top, rel, deadline, what)
+    return top, os.fsencode(rel_path.as_posix())
+
+
+def _exclude_file(top: Path, deadline: float) -> Path | None:
+    """The repository's `info/exclude` as git resolves it; None when git cannot say."""
     where = _out(git(top, ["rev-parse", "--git-path", "info/exclude"], deadline))
     if where is None:
         return None
-    exclude = Path(os.path.abspath(top / os.fsdecode(where)))  # noqa: PTH100 - `git-path` is relative to cwd
+    return Path(os.path.abspath(top / os.fsdecode(where)))  # noqa: PTH100 - `git-path` is relative to cwd
+
+
+def _write_and_verify(
+    exclude: Path, top: Path, rel: bytes, probes: list[bytes], deadline: float, *, sidecars: bool, what: str
+) -> str | None:
+    """Add the exclude lines and ask git again: the warning for a write that failed or a rule that re-includes the
+    file, else None (also when git could not answer)."""
     try:
         _add_lines(exclude, patterns(rel, sidecars=sidecars), deadline)
     except OSError as error:
@@ -292,4 +341,21 @@ def _ensure(capture: Path, deadline: float, *, sidecars: bool = True, what: str 
         return f"{WARNING_PREFIX} cannot write .git/info/exclude ({code}): the {what} may be committed by `git add`"
     if unignored(top, probes, deadline):  # None (git could not answer) stays silent
         return f"{WARNING_PREFIX} a .gitignore rule re-includes the {what}: it may be committed by `git add`"
-    return tracked_warning(top, rel, deadline, what)
+    return None
+
+
+def _ensure(capture: Path, deadline: float, *, sidecars: bool = True, what: str = "capture") -> str | None:
+    located = _locate(capture, deadline)
+    if located is None:
+        return None
+    top, rel = located
+    if _unsafe(rel):
+        return f"{WARNING_PREFIX} the {what} path has a control character, so it is not added to .git/info/exclude"
+    probes = [rel + suffix for suffix in (PROBE_SUFFIXES if sidecars else (b"",))]
+    if not unignored(top, probes, deadline):  # all ignored already, or git could not answer (tracked fails alike)
+        return tracked_warning(top, rel, deadline, what)
+    exclude = _exclude_file(top, deadline)
+    if exclude is None:
+        return None
+    warning = _write_and_verify(exclude, top, rel, probes, deadline, sidecars=sidecars, what=what)
+    return warning or tracked_warning(top, rel, deadline, what)

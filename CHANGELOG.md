@@ -6,6 +6,73 @@ All notable changes to the `usage-observer` plugin. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-18
+
+A cache line that shows how long each prompt cache stays warm and what a cold return costs, and alerts for runaway
+subagents, both on by default and both only observing. Captures no longer keep the full text of tool and API errors.
+No record shape was removed or changed: existing captures keep working.
+
+### Added
+
+- A cache line, the plugin's own status line under the prompt (seen as a row above your own `statusLine` with `fullscreenLayout` on; only the terminal was checked): for
+  the main session and up to three subagents, how long each prompt cache stays warm and what a cold return costs
+  (`cache main 1h, 59m left, cold $1.00 | sub1 5m, 2:10 left`). A cache turns urgent (`URGENT 0:55 left`) 1 minute
+  before a 5-minute cache expires and 10 minutes before a 1-hour cache expires, and reads `EXPIRED` with the price
+  after. The lifetime is read again after every step, so a drop from 1 hour to 5 minutes is followed; an unknown
+  lifetime counts as 5 minutes, and while a cache is on 5 minutes and you are at or past a plan limit the line says so. It is on by default; the `cacheLine`
+  option turns it off. It is built from fixed words, the labels `main` and `sub<N>`, and numbers only, and it only
+  observes. On Claude Code 2.1.322 with `fullscreenLayout` on, the harness puts a warning glyph and the plugin's name in front of it and hides
+  it in the detailed transcript view and under a dialog; that the option applies without a reload, and that the row
+  then clears, is designed but not verified on a live session.
+- Subagent alerts: one line in the transcript and one in the `/observer` pane when a subagent passes a size limit
+  (tokens used) or a time limit (active time), each alert at most once per subagent (a restart before the tally is saved can repeat it). Until calibrated the limits are 10,000,000
+  tokens and 2 hours. The `subagentAlerts` option turns them off. Nothing is stopped, killed or sent.
+- The `calibrate-alerts` skill and `scripts/agent_alert_calibration.py` show what other limits would have flagged
+  among your own past subagents and, after you agree to the numbers, write `alert-calibration.json` next to the
+  capture (0600; it needs at least 100 past subagents). A timestamp without a zone counts as UTC, and values that are
+  impossible (a percentile outside 1 to under 100, fewer than 0.1 hour, or a size limit below 1 token) are ignored.
+  The doctor gains a check of that file (a huge number does not crash it), and the Project tab a hint when the
+  alerts still use the defaults or an old calibration.
+- The `usage-reflection` skill explains the cache line and the subagent alerts from the text you paste, and hands
+  limit changes to `calibrate-alerts`.
+- The plugin reads the end of the session transcript (and a subagent's own) after a model step, only to find the
+  cache lifetime; it keeps the class `5m`, `1h` or `unknown` and nothing of the text. `SECURITY.md` and the plugin
+  README list every engine call and file read.
+- The reports that price usage know Claude Fable 5.2 and Claude Mythos 5.2 ($8 per million input tokens, $0.20 for
+  cache reads). The usage and quota reports also price their fast mode at twice the standard rate. Before this, their
+  messages were listed as models without a price and left out of every total.
+
+### Fixed
+
+- The cache line no longer holds up the step that triggered it: the transcript tail read now runs in the background,
+  and a transcript path that is not a regular file (a FIFO, a directory) is not read.
+- An `alert-calibration.json` that git tracks is ignored: the alert limits stay at the defaults, `/doctor` warns, and
+  `scripts/agent_alert_calibration.py --write` refuses a tracked file or a symbolic link. The check runs `git ls-files`
+  once per session start, only when a regular file is there.
+- The plugin now passes `claude plugin validate --strict` on Claude Code 2.1.323, and its hooks load on 2.1.287, the
+  declared minimum.
+- The mirror and the appender now drop the OTel `error` attribute (the full error message of a failed tool
+  call or API error, which Claude Code adds when `OTEL_LOG_TOOL_DETAILS` is set) by name, like the other content
+  attributes. The `error_type` attribute and the plugin's own boolean `error` field stay. `/doctor` now flags older captures that hold `error` entries; run
+  `scripts/scrub_capture.py` to remove them.
+- Cross-file dedupe no longer crashes on a transcript line whose token count is an integer too large for a
+  float; the count ranks as 0.
+- The report scripts that read a subagent's description file (`*.meta.json`) now refuse a FIFO, a link or an
+  oversized file instead of hanging, following the link or crashing, and the ticket report reads transcripts without
+  following a session or subagents folder swapped for a link. A subagent with no agent id counts as the main loop in
+  the iteration, token and context reports too.
+- `reflect_report.py` prints a `--capture` path escaped, so control characters in it cannot reach your terminal, and
+  its refusal for a missing task board no longer prints an absolute path.
+- The reasoning report now prices a fast-mode message at twice the standard rate on the models that have fast mode
+  (Fable 5.2, Mythos 5.2, Opus 5.5, Opus 5 and Opus 4.8), as the usage and quota reports already did. Its estimated
+  reasoning cost was half the real figure on those messages.
+- The cache-miss report now prices a miss at twice the standard figure when the request that missed ran in fast mode
+  (its `api_request` `speed` is exactly `fast`, on a model that has fast mode); its dollar figure was half the real one
+  on those misses.
+- The skill-overhead report now says, under its table, that it prices every request at the standard rate, so its
+  dollar figures are a lower bound on a fast-mode request (the plugin's step record documents no speed). The figures
+  themselves are unchanged.
+
 ## [0.6.0] - 2026-11-05
 
 New views for deciding how to use Claude: your costliest prompts, failing hooks and tool errors, per-session decision

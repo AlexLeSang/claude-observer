@@ -11,16 +11,28 @@ import os
 import subprocess
 from pathlib import Path
 
-# Variables that redirect where git looks or what it calls the work tree: an inherited one would answer for
-# another repository (`GIT_WORK_TREE=/usr` made a bare clone's worktree resolve to /usr).
-_GIT_ENV_DROPPED = frozenset(
-    {
-        "GIT_DIR",
-        "GIT_COMMON_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-    }
+# Variables that redirect where git looks, what it calls the work tree, or how it reads a pathspec: an inherited
+# one would answer for another repository (`GIT_WORK_TREE=/usr` made a bare clone's worktree resolve to /usr) or
+# make `:(literal,icase)name` match nothing (`GIT_LITERAL_PATHSPECS=1`: a tracked file read as untracked). The
+# `GIT_CEILING_DIRECTORIES` is deliberately not here: it fences a repository off (a dotfiles repository at $HOME)
+# and the plugin's resolveHome honours it. The same names, in the same order, are `GIT_REPO_ENV` in
+# plugin/hooks/alertEvents.ts; a test keeps them equal. Tested as needed: `GIT_OBJECT_DIRECTORY` (a missing one
+# makes git fail, so the home falls back to the cwd). `GIT_NAMESPACE` and `GIT_ALTERNATE_OBJECT_DIRECTORIES` changed
+# no answer in any experiment (git 2.56); they are cleared as harmless pass-throughs, with no test of their own.
+_GIT_ENV_ORDER = (
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
 )
+_GIT_ENV_DROPPED = frozenset(_GIT_ENV_ORDER)
 PLUGIN_CAPTURE_RELATIVE = Path("logs") / "agent-telemetry.mod.jsonl"
 
 

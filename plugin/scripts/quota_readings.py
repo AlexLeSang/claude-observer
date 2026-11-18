@@ -68,7 +68,7 @@ class ZoneError(ReadingError):
     """The zone of a reset time is missing or unknown; an optional line may drop its reset on this."""
 
 
-class TotalsUnavailable(ReadingError):  # noqa: N818
+class TotalsUnavailable(ReadingError):  # noqa: N818 - named for the state, as its base is
     """The eq-totals module could not be used."""
 
 
@@ -269,36 +269,50 @@ def _zone(name: str) -> Any:
         try:
             return ZoneInfo(exact)
         except (ValueError, OSError, LookupError):
-            pass
+            pass  # not a zone either: the ZoneError below says so
     raise ZoneError("unknown time zone")
+
+
+def _clock(match: re.Match[str]) -> tuple[int, int]:
+    """Hour (0-23) and minute of a matched reset time."""
+    hour, minute = int(match["h"]), int(match["m"] or 0)
+    if not 1 <= hour <= 12 or minute > 59:
+        raise ReadingError("unparsable reset time")
+    return hour % 12 + (12 if match["ap"].lower() == "pm" else 0), minute
+
+
+def _zone_of(match: re.Match[str]) -> Any:
+    tz = match["tz"]
+    if tz is None:
+        raise ZoneError("the reset time has no recognised time zone group")
+    if not _ZONE_NAME.fullmatch(tz):
+        raise ZoneError("unknown time zone")
+    return _zone(tz)
+
+
+def _dated_reset(match: re.Match[str], zone: Any, hour: int, minute: int, now: datetime) -> datetime:
+    """The next instant after `now` that falls on the written month and day."""
+    month = _MONTHS.get(match["mon"][:3].lower())
+    if month is None:
+        raise ReadingError("unparsable reset time")
+    for year in (now.year, now.year + 1):
+        try:
+            candidate = datetime(year, month, int(match["day"]), hour, minute, tzinfo=zone)
+        except ValueError:
+            continue  # no such day in that year (Feb 30): try next year, else refused below
+        if candidate.astimezone(UTC) > now:
+            return candidate.astimezone(UTC)
+    raise ReadingError("unparsable reset time")
 
 
 def _reset_time(rest: str, now: datetime) -> datetime:
     match = _RESET_TIME.match(rest)
     if not match:
         raise ReadingError("unparsable reset time")
-    hour, minute = int(match["h"]), int(match["m"] or 0)
-    if not 1 <= hour <= 12 or minute > 59:
-        raise ReadingError("unparsable reset time")
-    hour = hour % 12 + (12 if match["ap"].lower() == "pm" else 0)
-    tz = match["tz"]
-    if tz is None:
-        raise ZoneError("the reset time has no recognised time zone group")
-    if not _ZONE_NAME.fullmatch(tz):
-        raise ZoneError("unknown time zone")
-    zone = _zone(tz)
+    hour, minute = _clock(match)
+    zone = _zone_of(match)
     if match["mon"]:
-        month = _MONTHS.get(match["mon"][:3].lower())
-        if month is None:
-            raise ReadingError("unparsable reset time")
-        for year in (now.year, now.year + 1):
-            try:
-                candidate = datetime(year, month, int(match["day"]), hour, minute, tzinfo=zone)
-            except ValueError:
-                continue
-            if candidate.astimezone(UTC) > now:
-                return candidate.astimezone(UTC)
-        raise ReadingError("unparsable reset time")
+        return _dated_reset(match, zone, hour, minute, now)
     day: date = now.astimezone(zone).date()
     for _ in range(2):
         candidate = datetime.combine(day, time(hour, minute), tzinfo=zone)
@@ -306,6 +320,28 @@ def _reset_time(rest: str, now: datetime) -> datetime:
             return candidate.astimezone(UTC)
         day += timedelta(days=1)
     raise ReadingError("unparsable reset time")  # pragma: no cover - two days always contain a future instant
+
+
+def _usage_line(line: str, now: datetime) -> tuple[bool, str, float, datetime | None] | None:
+    """One `/usage` line: (is a session line, week label, percentage, reset), or None when it is neither."""
+    week_match = _WEEK_LINE.search(line)
+    session_match = None if week_match else _SESSION_LINE.search(line)
+    match = week_match or session_match
+    if not match:
+        return None
+    pct = parse_pct(match["pct"], "percentage")
+    resets = _RESETS.search(line, match.end())
+    label = " ".join(week_match["label"].lower().split()) if week_match else ""
+    reset = None
+    if resets:
+        try:
+            reset = _reset_time(resets["rest"], now)
+        except ZoneError:
+            # only the all-models week line needs its reset; a session or per-model line without a usable zone
+            # keeps its percentage and drops the reset
+            if label == "all models":
+                raise
+    return session_match is not None, label, pct, reset
 
 
 def parse_usage_text(text: str, now: datetime) -> dict[str, Any]:
@@ -318,27 +354,13 @@ def parse_usage_text(text: str, now: datetime) -> dict[str, Any]:
     for line in text[:MAX_TEXT_CHARS].splitlines():
         if len(line) > MAX_TEXT_LINE:
             continue
-        week_match = _WEEK_LINE.search(line)
-        session_match = None if week_match else _SESSION_LINE.search(line)
-        match = week_match or session_match
-        if not match:
+        parsed = _usage_line(line, now)
+        if parsed is None:
             continue
-        pct = parse_pct(match["pct"], "percentage")
-        resets = _RESETS.search(line, match.end())
-        label = " ".join(week_match["label"].lower().split()) if week_match else ""
-        reset = None
-        if resets:
-            try:
-                reset = _reset_time(resets["rest"], now)
-            except ZoneError:
-                # only the all-models week line needs its reset; a session or per-model line without a usable zone
-                # keeps its percentage and drops the reset
-                if label == "all models":
-                    raise
-        if session_match:
+        is_session, label, pct, reset = parsed
+        if is_session:
             session, session_reset = pct, reset
-            continue
-        if label == "all models":
+        elif label == "all models":
             if week is not None and (week, week_reset) != (pct, reset):
                 raise ReadingError("conflicting all-models week lines")
             week, week_reset = pct, reset
@@ -346,7 +368,7 @@ def parse_usage_text(text: str, now: datetime) -> dict[str, Any]:
             try:
                 models[_model_label(label)] = pct
             except ReadingError:
-                continue
+                continue  # a model label that is not usable: that line is dropped, the others count
     if week is None:
         raise ReadingError("no week (all models) percentage in the text")
     if week_reset is None:

@@ -86,9 +86,8 @@ def clean_windows(raw: object) -> list[dict[str, Any]]:
     return out
 
 
-def load_latest(path: Path) -> dict[str, Any] | None:
-    """The stored reading, validated, or None for a missing, unreadable, oversize, torn, wrong-typed or foreign file.
-    A symlink is not followed."""
+def _read_regular(path: Path) -> bytes | None:
+    """The bytes of a regular file (one more than the size cap at most), or None. A symlink is not followed."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
@@ -97,12 +96,18 @@ def load_latest(path: Path) -> dict[str, Any] | None:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None
         with os.fdopen(fd, "rb", closefd=False) as handle:
-            data = handle.read(MAX_FILE_BYTES + 1)
+            return handle.read(MAX_FILE_BYTES + 1)
     except OSError:
         return None
     finally:
         os.close(fd)
-    if len(data) > MAX_FILE_BYTES:
+
+
+def load_latest(path: Path) -> dict[str, Any] | None:
+    """The stored reading, validated, or None for a missing, unreadable, oversize, torn, wrong-typed or foreign file.
+    A symlink is not followed."""
+    data = _read_regular(path)
+    if data is None or len(data) > MAX_FILE_BYTES:
         return None
     try:
         doc = json.loads(data.decode("utf-8"))
@@ -124,7 +129,7 @@ def _write_temp(directory: Path, content: bytes) -> Path:
         try:
             fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         except FileExistsError:
-            continue
+            continue  # that temp name is taken by another writer: try the next suffix
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(content)
@@ -148,7 +153,7 @@ def _locked(path: Path) -> Any:
         fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
     except OSError:
-        pass
+        pass  # no lock (read-only dir, link, no flock): the atomic replace still holds
     try:
         yield
     finally:

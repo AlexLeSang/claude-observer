@@ -72,6 +72,7 @@ class Req:
     cc1h: int | None
     cost: float = 0.0
     request_id: str = ""  # a repeat of one id inside a session is one request
+    speed: str | None = None  # api_request `speed`, read only by `shortfall_cost`
 
 
 @dataclasses.dataclass(frozen=True)
@@ -215,15 +216,16 @@ class _Compactions:
 # --- the miss rule -------------------------------------------------------------------------------------------
 
 
-def shortfall_cost(model: str, ttl: float, shortfall: int, prompt_tokens: float) -> float | None:
+def shortfall_cost(model: str, ttl: float, shortfall: int, prompt_tokens: float, speed: object = None) -> float | None:
     """`shortfall * (write rate - read rate)` in USD for `model` at the lifetime `ttl`; None when unpriced.
-    Write rates are 1.25x (5 min) and 2x (1 h) the input price."""
+    Write rates are 1.25x (5 min) and 2x (1 h) the input price. `speed` is that of the missing request:
+    exactly the text fast on a model with fast mode multiplies the whole figure once by `model_prices.speed_multiplier`."""
     prices = mp.model_prices(model, prompt_tokens)
     if prices is None:
         return None
     price_in, price_read = prices
     factor = mp.CACHE_WRITE_1H if ttl == TTL_1H else mp.CACHE_WRITE_5M
-    return shortfall * (price_in * factor - price_read) / PER_MTOK
+    return mp.speed_multiplier(speed, model) * shortfall * (price_in * factor - price_read) / PER_MTOK
 
 
 def label(prev: Req, now: Req, lifetime: float | None) -> str:
@@ -260,7 +262,7 @@ def _judge(
             out.rebuilds += 1
             continue
         prompt = now.tokens[0] + now.tokens[2] + now.tokens[3]
-        cost = shortfall_cost(now.model, known if known is not None else TTL_5M, shortfall, prompt)
+        cost = shortfall_cost(now.model, known if known is not None else TTL_5M, shortfall, prompt, now.speed)
         miss = Miss(label(prev, now, known), shortfall, cost)
         out.misses.append(miss)
         found[id(now)] = miss
@@ -339,56 +341,6 @@ def step_loops(keyless: list[Req], steps: list[Step]) -> tuple[dict[str, list[Re
         else:
             loops[agent].append(req)
     return loops, lost
-
-
-@dataclasses.dataclass(frozen=True)
-class Recall:
-    """The step key against the `agent_id` key on requests that carry `agent_id`."""
-
-    truth_misses: int
-    truth_tokens: int
-    found_misses: int  # misses the step key finds that the agent_id key also finds
-    found_tokens: int
-    false_misses: int  # misses the step key finds that the agent_id key does not
-    false_tokens: int
-
-    @property
-    def recall_tokens(self) -> float | None:
-        return self.found_tokens / self.truth_tokens if self.truth_tokens else None
-
-    @property
-    def recall_misses(self) -> float | None:
-        return self.found_misses / self.truth_misses if self.truth_misses else None
-
-
-def step_recall(reqs: list[Req], steps: list[Step], compactions: list[Compaction]) -> Recall:
-    """Judge the requests that carry `agent_id` by `agent_id` (the truth), then again with the id removed and the
-    step key; compare the misses found."""
-    carrying = [r for r in prepare(reqs) if r.agent_id]
-    index = _Compactions(compactions)
-    truth: dict[int, Miss] = {}
-    by_agent: dict[str, list[Req]] = defaultdict(list)
-    for req in carrying:
-        by_agent[req.agent_id].append(req)
-    for agent, loop in by_agent.items():
-        truth.update(_judge(loop, index.agent_excuser(agent), is_main=False, out=Row(), gaps=None))
-    stripped = {id(r): dataclasses.replace(r, agent_id="") for r in carrying}
-    loops, _ = step_loops([stripped[id(r)] for r in carrying], steps)
-    back = {id(s): id(o) for o, s in ((o, stripped[id(o)]) for o in carrying)}
-    got: dict[int, Miss] = {}
-    for agent, loop in loops.items():
-        got.update(_judge(loop, index.agent_excuser(agent), is_main=False, out=Row(), gaps=None))
-    got = {back[k]: v for k, v in got.items()}
-    hit = {k: v for k, v in got.items() if k in truth}
-    false = {k: v for k, v in got.items() if k not in truth}
-    return Recall(
-        len(truth),
-        sum(m.shortfall for m in truth.values()),
-        len(hit),
-        sum(m.shortfall for m in hit.values()),
-        len(false),
-        sum(m.shortfall for m in false.values()),
-    )
 
 
 # --- lines ---------------------------------------------------------------------------------------------------

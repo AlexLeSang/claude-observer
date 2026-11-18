@@ -15,19 +15,38 @@ concurrency:
 
 jobs:
   validate-and-install:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      CLAUDE_CODE_VERSION: "2.1.312"
+      CLAUDE_CODE_VERSION: "2.1.311"
+      CLAUDE_CODE_INTEGRITY: "sha512-7SgBitii1ZscdbRJXLcub7Vv2pfvH3wo7RrCKg4vZpklIfz9HgigJFFJGIjCY6jzoPDvbQcwwugvm3A8PTejzw=="
+      CLAUDE_CODE_PLATFORM_INTEGRITY: "sha512-dk1lVMt7n+NlYucKM7dLp/PfrK32pa/4oKQkacfazlSj8rG+hkH67wnDnaFG9Gs2al3OjK8PTVHgZ2WGHXoWUg=="
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
 
-      - name: Install Claude Code (pinned)
+      - name: Install Claude Code (pinned, integrity-checked, no lifecycle scripts)
         run: |
-          npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
-          claude --version
+          # The wrapper package ships a placeholder binary; its postinstall script would link the real one from the
+          # platform package. Scripts stay off, so both tarballs are verified and the link is made here.
+          pack_dir="${RUNNER_TEMP}/claude-pack"
+          prefix="${RUNNER_TEMP}/claude-cli"
+          mkdir -p "${pack_dir}" "${prefix}"
+          (cd "${pack_dir}" && npm pack "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "@anthropic-ai/claude-code-linux-x64@${CLAUDE_CODE_VERSION}")
+          wrapper="${pack_dir}/anthropic-ai-claude-code-${CLAUDE_CODE_VERSION}.tgz"
+          platform="${pack_dir}/anthropic-ai-claude-code-linux-x64-${CLAUDE_CODE_VERSION}.tgz"
+          verify() {
+            actual="sha512-$(openssl dgst -sha512 -binary "$1" | openssl base64 -A)"
+            test "${actual}" = "$2" || { echo "FAIL: $1 integrity ${actual} is not the pinned $2"; exit 1; }
+          }
+          verify "${wrapper}" "${CLAUDE_CODE_INTEGRITY}"
+          verify "${platform}" "${CLAUDE_CODE_PLATFORM_INTEGRITY}"
+          npm install --prefix "${prefix}" --ignore-scripts --no-audit --no-fund "${wrapper}" "${platform}"
+          modules="${prefix}/node_modules/@anthropic-ai"
+          install -m 0755 "${modules}/claude-code-linux-x64/claude" "${modules}/claude-code/bin/claude.exe"
+          echo "${prefix}/node_modules/.bin" >> "${GITHUB_PATH}"
+          PATH="${prefix}/node_modules/.bin:${PATH}" claude --version
 
       - name: Validate the marketplace (--strict)
         run: claude plugin validate --strict .

@@ -259,10 +259,6 @@ class SessionFixed:
         return sum(a.chars for a in self.attachments if self.in_first(a))
 
     @property
-    def attachments_all(self) -> int:
-        return sum(a.chars for a in self.attachments)
-
-    @property
     def fixed(self) -> int:
         return (self.system or 0) + (self.context or 0) + self.tools_chars + self.attachments_first
 

@@ -7,9 +7,9 @@
 
 import type { LiveTotals, TokenTally } from '../types'
 
-export const SPARK_POINTS = 60
+const SPARK_POINTS = 60
 
-export function emptyTally(): TokenTally {
+function emptyTally(): TokenTally {
   return { input: 0, output: 0, cacheRead: 0, cacheCreation: 0, steps: 0 }
 }
 

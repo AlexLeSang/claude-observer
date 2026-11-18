@@ -182,13 +182,10 @@ def _in_window(ts: datetime, since: datetime | None, until: datetime | None) -> 
     return not ((since is not None and ts < since) or (until is not None and ts > until))
 
 
-def collect(
-    dirs: list[Path], since: datetime | None, until: datetime | None, pattern: re.Pattern[str]
-) -> dict[str, Any]:
-    """Weigh every deduplicated message of the project's directories that falls in the window.
-
-    Returns plain data: per message (day, item, kind, role, model family, label, weight) in `messages`, the
-    unpriced models and the number of undated messages. Dispatch metadata is read once per transcript."""
+def _gather_candidates(
+    dirs: list[Path],
+) -> tuple[list[tuple[ti.TranscriptContext, tuple[ti.AssistantMessageEvent, ...]]], int]:
+    """The assistant events of every readable transcript under `dirs`, and how many linked files were skipped."""
     candidates: list[tuple[ti.TranscriptContext, tuple[ti.AssistantMessageEvent, ...]]] = []
     skipped_files = 0
     for directory in dirs:
@@ -199,17 +196,66 @@ def collect(
             events = tuple(e for e in ti.iter_events(context) if isinstance(e, ti.AssistantMessageEvent))
             if events:
                 candidates.append((context, events))
+    return candidates, skipped_files
+
+
+def count_unpriced(unpriced: dict[str, dict[str, int]], event: ti.AssistantMessageEvent, model: str | None) -> None:
+    if event.usage is None:
+        return
+    counts = unpriced.setdefault(_clean(model or aur.NO_MODEL), {"requests": 0, "tokens": 0})
+    counts["requests"] += 1
+    counts["tokens"] += int(sum(usage_tokens(event.usage, k) for k in _TOKEN_KEYS))
+
+
+def _message_row(
+    event: ti.AssistantMessageEvent,
+    stamp: datetime,
+    model: str | None,
+    ident: dict[str, Any],
+) -> dict[str, Any] | None:
+    """The row of one priced event, or None when its weight is not a usable number."""
+    weight = aur.eq_weight(event.usage, model)
+    if not (math.isfinite(weight) and weight >= 0):
+        return None
+    return {
+        "ts": stamp,
+        "day": stamp.date().isoformat(),
+        "item": ident["item"],
+        "kind": ident["kind"],
+        "role": ident["role"],
+        "model": aur.model_family(model),
+        "label": ident["label"],
+        "eq": weight,
+    }
+
+
+def _identity_of(context: ti.TranscriptContext, pattern: re.Pattern[str]) -> dict[str, Any]:
+    """Work item, kind, role and label of one transcript, read once."""
+    ticket = aur.ticket_of_dispatch(context)
+    item, kind = (f"#{ticket}", "ticket") if ticket != aur.UNATTRIBUTED else (_clean(context.session_id), "session")
+    return {
+        "item": item,
+        "kind": kind,
+        "role": _clean(aur.role_of(context)),
+        "label": _label_of(pattern, aur.meta_description(context)),
+    }
+
+
+def collect(
+    dirs: list[Path], since: datetime | None, until: datetime | None, pattern: re.Pattern[str]
+) -> dict[str, Any]:
+    """Weigh every deduplicated message of the project's directories that falls in the window.
+
+    Returns plain data: per message (day, item, kind, role, model family, label, weight) in `messages`, the
+    unpriced models and the number of undated messages. Dispatch metadata is read once per transcript."""
+    candidates, skipped_files = _gather_candidates(dirs)
     messages: list[dict[str, Any]] = []
     unpriced: dict[str, dict[str, int]] = {}
     undated = 0
     for context, owned in ti.dedupe_across_files(candidates):
         if not owned:
             continue
-        ticket = aur.ticket_of_dispatch(context)
-        item, kind = (f"#{ticket}", "ticket") if ticket != aur.UNATTRIBUTED else (_clean(context.session_id), "session")
-        role = _clean(aur.role_of(context))
-        description = aur.meta_description(context)
-        label = _label_of(pattern, description)
+        ident = _identity_of(context, pattern)
         meta_model = context.meta_model if isinstance(context.meta_model, str) else None
         for event in owned:
             stamp = aur.parse_timestamp(event.timestamp)
@@ -220,26 +266,11 @@ def collect(
                 continue
             model = event.model or meta_model
             if not aur.is_priced(model):
-                if event.usage is not None:
-                    counts = unpriced.setdefault(_clean(model or aur.NO_MODEL), {"requests": 0, "tokens": 0})
-                    counts["requests"] += 1
-                    counts["tokens"] += int(sum(usage_tokens(event.usage, k) for k in _TOKEN_KEYS))
+                count_unpriced(unpriced, event, model)
                 continue
-            weight = aur.eq_weight(event.usage, model)
-            if not (math.isfinite(weight) and weight >= 0):
-                continue
-            messages.append(
-                {
-                    "ts": stamp,
-                    "day": stamp.date().isoformat(),
-                    "item": item,
-                    "kind": kind,
-                    "role": role,
-                    "model": aur.model_family(model),
-                    "label": label,
-                    "eq": weight,
-                }
-            )
+            row = _message_row(event, stamp, model, ident)
+            if row is not None:
+                messages.append(row)
     return {"messages": messages, "unpriced": unpriced, "undated": undated, "skipped_files": skipped_files}
 
 
@@ -252,6 +283,80 @@ def _group(messages: list[dict[str, Any]], field: str, rate: float | None) -> li
     for m in messages:
         sums.add(m[field] or UNLABELLED, m["eq"])
     return [{"key": k, "eq": sums.eq(k), "points": _points(sums.eq(k), rate)} for k in sums.weights]
+
+
+def _forecast_burn(
+    f: dict[str, Any],
+    messages: list[dict[str, Any]],
+    rate: float,
+    since: datetime | None,
+    until: datetime | None,
+    now: datetime,
+) -> None:
+    """This project's points per day over the last 7 days, or since the window start if shorter."""
+    end = min(until, now) if until else now  # a future --until does not move the window past the clock
+    start = end - WEEK if since is None else max(since, end - WEEK)
+    days = (end - start).total_seconds() / 86400
+    if days > 0:
+        points = math.fsum(m["eq"] for m in messages if start <= m["ts"] <= end) * rate
+        f["burn_rate"] = {"points_per_day": points / days, "points": points, "days": days}
+    else:
+        f["reasons"].append("the window is empty: no burn rate")
+
+
+def _forecast_current(
+    f: dict[str, Any],
+    messages: list[dict[str, Any]],
+    rate: float,
+    readings: list[qr.Reading],
+    since: datetime | None,
+    until: datetime | None,
+    now: datetime,
+) -> None:
+    """The current week %: the newest reading plus this project's points since it."""
+    newest = max(readings, key=lambda r: r.ts)
+    f["as_of"] = _iso(newest.ts)
+    if newest.week_reset <= now:
+        f["reasons"].append("the newest reading is from an earlier week: no current week %")
+    elif (since is None or since <= newest.ts) and (until is None or until >= newest.ts):
+        f["current_pct"] = newest.week_pct + math.fsum(m["eq"] for m in messages if m["ts"] > newest.ts) * rate
+    else:
+        f["reasons"].append("the window does not cover the time since the newest reading: no current week %")
+
+
+def _forecast_items_fit(f: dict[str, Any], room: float, median: float) -> None:
+    if median <= 0:
+        f["reasons"].append("the median work item costs zero points: no items_fit")
+    elif math.isfinite(room / median):
+        f["items_fit"] = math.floor(room / median)
+    else:
+        f["reasons"].append("items_fit is not a usable count")
+
+
+def _forecast_days_to(f: dict[str, Any], room: float) -> None:
+    burn = f["burn_rate"]
+    if burn is not None and burn["points_per_day"] > 0:
+        days_to = room / burn["points_per_day"]
+        if math.isfinite(days_to):
+            f["days_to"] = days_to
+        else:
+            f["reasons"].append("days_to is not a usable number")
+    elif burn is not None:
+        f["reasons"].append("no burn in the period: no days_to")
+
+
+def _forecast_room(f: dict[str, Any], until_pct: float | None, median: float) -> None:
+    """Items that fit and days to reach `until_pct`, from the current week %."""
+    current = f["current_pct"]
+    if until_pct is None:
+        f["reasons"].append("no --until-pct given: no items_fit and no days_to")
+    elif current is not None:
+        room = until_pct - current
+        if room <= 0:
+            f["items_fit"], f["days_to"] = 0, 0.0
+        else:
+            _forecast_items_fit(f, room, median)
+            _forecast_days_to(f, room)
 
 
 def make_forecast(
@@ -282,53 +387,15 @@ def make_forecast(
     if rate is None:
         reasons.append("no calibration")
         return f
-    # burn rate: this project's points per day over the last 7 days, or since the window start if shorter
-    end = min(until, now) if until else now  # a future --until does not move the window past the clock
-    start = end - WEEK if since is None else max(since, end - WEEK)
-    days = (end - start).total_seconds() / 86400
-    if days > 0:
-        points = math.fsum(m["eq"] for m in messages if start <= m["ts"] <= end) * rate
-        f["burn_rate"] = {"points_per_day": points / days, "points": points, "days": days}
-    else:
-        reasons.append("the window is empty: no burn rate")
-    # the current week %: the newest reading plus this project's points since it
-    newest = max(readings, key=lambda r: r.ts)
-    f["as_of"] = _iso(newest.ts)
-    if newest.week_reset <= now:
-        reasons.append("the newest reading is from an earlier week: no current week %")
-    elif (since is None or since <= newest.ts) and (until is None or until >= newest.ts):
-        f["current_pct"] = newest.week_pct + math.fsum(m["eq"] for m in messages if m["ts"] > newest.ts) * rate
-    else:
-        reasons.append("the window does not cover the time since the newest reading: no current week %")
+    _forecast_burn(f, messages, rate, since, until, now)
+    _forecast_current(f, messages, rate, readings, since, until, now)
     costs = [r["points"] for r in by_item if r["points"] is not None]
     if not costs:
         reasons.append("no work items in the window")
         return f
     median = statistics.median(costs)
     f["items"] = {"count": len(costs), "median_points": median, "min_points": min(costs), "max_points": max(costs)}
-    current = f["current_pct"]
-    if until_pct is None:
-        reasons.append("no --until-pct given: no items_fit and no days_to")
-    elif current is not None:
-        room = until_pct - current
-        if room <= 0:
-            f["items_fit"], f["days_to"] = 0, 0.0
-        else:
-            if median <= 0:
-                reasons.append("the median work item costs zero points: no items_fit")
-            elif math.isfinite(room / median):
-                f["items_fit"] = math.floor(room / median)
-            else:
-                reasons.append("items_fit is not a usable count")
-            burn = f["burn_rate"]
-            if burn is not None and burn["points_per_day"] > 0:
-                days_to = room / burn["points_per_day"]
-                if math.isfinite(days_to):
-                    f["days_to"] = days_to
-                else:
-                    reasons.append("days_to is not a usable number")
-            elif burn is not None:
-                reasons.append("no burn in the period: no days_to")
+    _forecast_room(f, until_pct, median)
     return f
 
 
@@ -441,52 +508,72 @@ def _render_forecast(f: dict[str, Any]) -> list[str]:
     return lines
 
 
-def render(data: dict[str, Any]) -> str:
-    """The table: every figure is the one in `data`, formatted."""
+_GROUPS = (
+    ("By day:", "by_day"),
+    ("By work item:", "by_item"),
+    ("By role:", "by_role"),
+    ("By model family:", "by_model"),
+    ("By label:", "by_label"),
+)
+
+
+def _fig(row: dict[str, Any]) -> str:
+    text = f"{row['eq']:>16,.1f}"
+    return text if row["points"] is None else f"{text} {row['points']:>10.3f}"
+
+
+def _render_calibration(data: dict[str, Any]) -> list[str]:
     rate = data["points_per_eq"]
-    lines = [f"Project {data['project']}: usage {data['window']['source']}"]
-    window = data["window"]
-    lines.append(f"Window: {window['since'] or 'start'} to {window['until'] or 'now'}")
-    lines.extend(f"note: {n}" for n in data["notices"])
-
-    def fig(row: dict[str, Any]) -> str:
-        text = f"{row['eq']:>16,.1f}"
-        return text if row["points"] is None else f"{text} {row['points']:>10.3f}"
-
     head = "eq" if rate is None else "eq        points"
-    lines.append(f"Total: {fig(data['totals']).strip()}  ({head.strip()})")
+    lines = [f"Total: {_fig(data['totals']).strip()}  ({head.strip()})"]
     if rate is None:
         lines.append("no calibration: points not shown")
         lines.append("rests on: none")
-    else:
-        lines.append(f"points per eq: {rate:.3e} = {1 / rate / 1e6:.1f}M eq per point")
-        lines.append("rests on: " + "; ".join(f"{r['ts']} {r['week_pct']:g}%" for r in data["rests_on"]))
-        if data["coarse"]:
-            lines.append("coarse: a pair of readings spans under 3 points, the figure may be off by a few percent")
-    if data["readings_skipped_lines"]:
-        n = data["readings_skipped_lines"]
-        lines.append(f"{n} line{'' if n == 1 else 's'} skipped in the readings file")
-    for title, group in (
-        ("By day:", "by_day"),
-        ("By work item:", "by_item"),
-        ("By role:", "by_role"),
-        ("By model family:", "by_model"),
-        ("By label:", "by_label"),
-    ):
+        return lines
+    lines.append(f"points per eq: {rate:.3e} = {1 / rate / 1e6:.1f}M eq per point")
+    lines.append("rests on: " + "; ".join(f"{r['ts']} {r['week_pct']:g}%" for r in data["rests_on"]))
+    if data["coarse"]:
+        lines.append("coarse: a pair of readings spans under 3 points, the figure may be off by a few percent")
+    return lines
+
+
+def _render_groups(data: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for title, group in _GROUPS:
         if group not in data:
             continue
         lines.append(title)
         for row in data[group]:
-            lines.append(f"  {row['key']:<24} {fig(row)}")
+            lines.append(f"  {row['key']:<24} {_fig(row)}")
             if group == "by_item":
                 for role, split in row["roles"].items():
-                    lines.append(f"    - {role:<22} {fig(split)}")
+                    lines.append(f"    - {role:<22} {_fig(split)}")
+    return lines
+
+
+def _render_exclusions(data: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
     if data["undated_messages"]:
         lines.append(f"{data['undated_messages']} messages without a timestamp were left out")
     if data["skipped_files"]:
         lines.append(f"{data['skipped_files']} file(s) skipped in transcripts (links are not followed)")
     for model, counts in sorted(data["unpriced"].items()):
         lines.append(f"unpriced model, not counted: {model} ({counts['requests']} requests, {counts['tokens']} tokens)")
+    return lines
+
+
+def render(data: dict[str, Any]) -> str:
+    """The table: every figure is the one in `data`, formatted."""
+    lines = [f"Project {data['project']}: usage {data['window']['source']}"]
+    window = data["window"]
+    lines.append(f"Window: {window['since'] or 'start'} to {window['until'] or 'now'}")
+    lines.extend(f"note: {n}" for n in data["notices"])
+    lines.extend(_render_calibration(data))
+    if data["readings_skipped_lines"]:
+        n = data["readings_skipped_lines"]
+        lines.append(f"{n} line{'' if n == 1 else 's'} skipped in the readings file")
+    lines.extend(_render_groups(data))
+    lines.extend(_render_exclusions(data))
     lines.extend(_render_forecast(data["forecast"]))
     lines.append(f"Caveat: {data['caveat']}")
     return "\n".join(lines)
@@ -497,6 +584,46 @@ AHEAD_TEXT = "the reset is more than one window ahead of the reading"
 
 def _no_line(reason: str) -> dict[str, Any]:
     return {"basis": PACE_LABEL, "line": False, "reason": reason, "percent_at_reset": None, "reaches_100_at": None}
+
+
+def _is_number(value: object) -> bool:
+    """A real number as the file gives one: an int or float, never a bool, a str or None."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _share_refusal(window: dict[str, Any], end: datetime, now: datetime) -> str | None:
+    """The reason a window cannot be paced from its reset and share, or None."""
+    if window["elapsed_percent"] is None:
+        # No share of the window has run: the reset is ahead of the clock by more than a window, or (an instant too
+        # near year 1 to subtract a window from) behind it. Only the clock tells them apart, not the missing share.
+        return AHEAD_TEXT if end > now else "the window has reset"
+    if window["state"] != "fresh":
+        return "the reading is older than its limit"
+    return None
+
+
+def _figure_refusal(used: Any, elapsed: Any) -> str | None:
+    """The reason the used percent or the elapsed share cannot be paced, or None."""
+    if not _is_number(used) or not 0 <= used <= 100:
+        return "the used percent is not between 0 and 100"
+    if not _is_number(elapsed):
+        return "the elapsed share is not a number"
+    if not -math.inf < elapsed < 100:  # also false for nan; compares without converting a huge int to a float
+        return "the window is over"
+    if elapsed < MIN_ELAPSED_PERCENT:
+        return "the window has only just begun"
+    return None
+
+
+def _reaches_100(window: dict[str, Any], end: datetime, now: datetime) -> str:
+    used, elapsed = window["used_percent"], window["elapsed_percent"]
+    length = ql.WINDOW_LENGTH[window["kind"]]
+    seconds = (100 - used) / used * (elapsed / 100 * length.total_seconds())
+    # Never after the reset: a figure printed as 100 at the reset (99.96 prints so) reaches 100 a few seconds
+    # past it on the exact arithmetic, and the line says "100% at reset". Clamping the span, not the sum,
+    # keeps `now + span` inside the datetime range.
+    span = min(timedelta(seconds=seconds), end - now)
+    return ql.format_instant(now + span)  # whole milliseconds, like every other instant
 
 
 def linear_pace(window: dict[str, Any], now: datetime) -> dict[str, Any]:
@@ -511,22 +638,11 @@ def linear_pace(window: dict[str, Any], now: datetime) -> dict[str, Any]:
     end = ql.parse_instant(resets)
     if end is None:
         return _no_line("no reset time")
-    if elapsed is None:
-        return _no_line(AHEAD_TEXT)
-    if window["state"] != "fresh":
-        return _no_line("the reading is older than its limit")
-    if used is None or isinstance(used, bool) or not 0 <= used <= 100:
-        return _no_line("the used percent is not between 0 and 100")
-    if not math.isfinite(elapsed) or elapsed >= 100:
-        return _no_line("the window is over")
-    if elapsed < MIN_ELAPSED_PERCENT:
-        return _no_line("the window has only just begun")
+    reason = _share_refusal(window, end, now) or _figure_refusal(used, elapsed)
+    if reason is not None:
+        return _no_line(reason)
     at_reset = round(used * 100 / elapsed, 1)  # the printed figure decides, so the text cannot contradict itself
-    reaches: str | None = None
-    if at_reset >= 100:  # also true at 100 used, which reaches 100 now
-        length = ql.WINDOW_LENGTH[window["kind"]]
-        seconds = (100 - used) / used * (elapsed / 100 * length.total_seconds())
-        reaches = ql.format_instant(now + timedelta(seconds=seconds))  # whole milliseconds, like every other instant
+    reaches = _reaches_100(window, end, now) if at_reset >= 100 else None  # also true at 100 used: reaches 100 now
     return {
         "basis": PACE_LABEL,
         "line": True,
@@ -534,6 +650,11 @@ def linear_pace(window: dict[str, Any], now: datetime) -> dict[str, Any]:
         "percent_at_reset": at_reset,
         "reaches_100_at": reaches,
     }
+
+
+def _row_clock(state: str, observed: datetime, now: datetime) -> datetime:
+    """The clock a window is paced on: the reading's own, except a reset window, which keeps `now`."""
+    return now if state == "reset" else observed
 
 
 def build_pace(now: datetime, path: Path | None = None) -> dict[str, Any]:
@@ -550,7 +671,7 @@ def build_pace(now: datetime, path: Path | None = None) -> dict[str, Any]:
         # The used percent is the value at `observed_at`, so the elapsed percent and the 100% instant are taken on
         # that clock too (a reading up to the age limit old would otherwise pair an old used with a new elapsed).
         # A reset window has no used percent: it keeps `now`.
-        clock = now if window["state"] == "reset" else observed
+        clock = _row_clock(window["state"], observed, now)
         row = {
             "kind": window["kind"],
             "used_percent": window["percent"],
@@ -581,14 +702,17 @@ def render_pace(pace: dict[str, Any], now: datetime) -> str:
     if pace["state"] != "ok":
         return "Pace: unknown (no usable quota reading on this machine)"
     lines = [f"Pace (reading of {pace['observed_at']}, age {pace['age_seconds']:g} s): used % against elapsed %"]
+    observed = ql.parse_instant(pace["observed_at"]) or now
     for w in pace["windows"]:
         used = "reset, no percent" if w["used_percent"] is None else f"used {w['used_percent']:g}% ({w['state']})"
         if w["elapsed_percent"] is not None:
             elapsed = f"elapsed {w['elapsed_percent']:.1f}%"
-        elif ql.parse_instant(w["resets_at"]) is None:
+        elif (end := ql.parse_instant(w["resets_at"])) is None:
             elapsed = "elapsed n/a (no reset time)"
-        else:
+        elif end > _row_clock(w["state"], observed, now):
             elapsed = f"elapsed n/a ({AHEAD_TEXT})"
+        else:  # a reset too near year 1 to take a window from, so no share was computed
+            elapsed = "elapsed n/a (the reset time has passed)"
         lines.append(f"  {w['kind']}: {used}, {elapsed}")
         lin = w["linear_pace"]
         if lin["reason"] == "display only":
